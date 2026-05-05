@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +65,24 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#include <string.h>
+#include <stdio.h>
 
+static void uart_log(const char *msg)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+}
+
+/* Thin printf wrapper — max 128 chars per call */
+static void uart_printf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    uart_log(buf);
+}
 /* USER CODE END 0 */
 
 /**
@@ -102,16 +119,25 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  uart_log("\r\n=== SYSTEM BOOT ===\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
-  {
-    /* USER CODE END WHILE */
+{
+  /* USER CODE BEGIN 3 */
+  static uint32_t last_tick  = 0;
+  static uint32_t loop_count = 0;
 
-    /* USER CODE BEGIN 3 */
+  if ((HAL_GetTick() - last_tick) >= 1000)
+  {
+    last_tick = HAL_GetTick();
+    loop_count++;
+    
+    // This is your "Virtual LED"
+    uart_printf("[SYS_ALIVE] Uptime: %lu s | Loops: %lu\r\n", 
+                HAL_GetTick() / 1000, loop_count);
   }
   /* USER CODE END 3 */
 }
