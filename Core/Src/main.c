@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +65,24 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#include <string.h>
+#include <stdio.h>
 
+static void uart_log(const char *msg)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+}
+
+/* Thin printf wrapper — max 128 chars per call */
+static void uart_printf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    uart_log(buf);
+}
 /* USER CODE END 0 */
 
 /**
@@ -102,7 +119,90 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* --- SDIO Test: SD Card write + read back --- */
+  uart_log("=== SDIO Test: SD Card ===\r\n");
 
+  HAL_SD_CardInfoTypeDef sd_card_info = {0};
+
+  if (HAL_SD_GetCardInfo(&hsd1, &sd_card_info) != HAL_OK)
+  {
+      uart_log("  ERROR: HAL_SD_GetCardInfo failed. Card not detected?\r\n");
+  }
+  else
+  {
+      uart_printf("  Card detected: %lu MB (%lu blocks x %lu bytes)\r\n",
+          (sd_card_info.LogBlockNbr / 2048UL),
+          sd_card_info.LogBlockNbr,
+          sd_card_info.LogBlockSize);
+
+      /* --- Write test: fill 512-byte block with known pattern --- */
+      const uint32_t TEST_BLOCK = 100UL;  /* Use block 100 — safe distance from boot sector */
+      uint8_t  write_buf[512];
+      uint8_t  read_buf[512];
+
+      for (int i = 0; i < 512; i++)
+          write_buf[i] = (uint8_t)(i & 0xFF);  /* Pattern: 0x00,0x01,...0xFF,0x00,... */
+
+      uart_log("  Writing test block...\r\n");
+      HAL_StatusTypeDef wr = HAL_SD_WriteBlocks(
+          &hsd1, write_buf, TEST_BLOCK, 1, 2000);
+
+      if (wr != HAL_OK)
+      {
+          uart_log("  WRITE ERROR.\r\n");
+      }
+      else
+      {
+          /* Wait for card to finish writing */
+          uint32_t timeout = HAL_GetTick() + 2000;
+          while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+          {
+              if (HAL_GetTick() > timeout)
+              {
+                  uart_log("  WRITE TIMEOUT waiting for TRANSFER state.\r\n");
+                  break;
+              }
+          }
+
+          /* --- Read back --- */
+          uart_log("  Reading test block back...\r\n");
+          HAL_StatusTypeDef rd = HAL_SD_ReadBlocks(
+              &hsd1, read_buf, TEST_BLOCK, 1, 2000);
+
+          if (rd != HAL_OK)
+          {
+              uart_log("  READ ERROR.\r\n");
+          }
+          else
+          {
+              /* Wait for transfer complete */
+              timeout = HAL_GetTick() + 2000;
+              while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+              {
+                  if (HAL_GetTick() > timeout) break;
+              }
+
+              /* Verify pattern */
+              uint8_t sd_pass = 1;
+              for (int i = 0; i < 512; i++)
+              {
+                  if (read_buf[i] != write_buf[i])
+                  {
+                      uart_printf("  MISMATCH at byte %d: wrote 0x%02X, read 0x%02X\r\n",
+                          i, write_buf[i], read_buf[i]);
+                      sd_pass = 0;
+                      break;
+                  }
+              }
+
+              if (sd_pass)
+                  uart_log("  Write + Read back: PASS (512 bytes verified)\r\n");
+          }
+      }
+  }
+
+  uart_log("=== SDIO Test Done ===\r\n\r\n");
+  HAL_Delay(100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
