@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +65,24 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#include <string.h>
+#include <stdio.h>
 
+static void uart_log(const char *msg)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+}
+
+/* Thin printf wrapper — max 128 chars per call */
+static void uart_printf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    uart_log(buf);
+}
 /* USER CODE END 0 */
 
 /**
@@ -102,7 +119,51 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* --- UART Test: A7670G LTE Module (PB8 load switch) --- */
+  uart_log("=== UART Test: A7670G ===\r\n");
 
+  /*
+  * PB8 = HIGH -> load switch ON -> A7670G powered from LiPo
+  * Wait 3s for module boot before sending AT
+  */
+  uart_log("  Enabling A7670G via PB8 load switch...\r\n");
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+  HAL_Delay(3000);  /* Module boot time: ~1-3s typical */
+
+  const char   *at_cmd       = "AT\r\n";
+  uint8_t       lte_rx[64]   = {0};
+  uint16_t      lte_rx_len   = 0;
+
+  /* Send AT command */
+  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 100);
+  HAL_Delay(500);  /* Give module time to respond */
+
+  /* Non-blocking poll: read whatever arrived */
+  HAL_StatusTypeDef lte_status = HAL_UART_Receive(
+      &huart1, lte_rx, sizeof(lte_rx) - 1, 1000);
+
+  /* HAL_TIMEOUT is normal here — it means the timeout expired after
+    partial data; check for "OK" in whatever was received anyway */
+  lte_rx[sizeof(lte_rx) - 1] = '\0';
+
+  if (strstr((char *)lte_rx, "OK") != NULL)
+  {
+      uart_log("  AT -> OK received: PASS\r\n");
+  }
+  else if (lte_status == HAL_OK || lte_rx[0] != '\0')
+  {
+      uart_printf("  AT -> unexpected response: [%s]\r\n", lte_rx);
+  }
+  else
+  {
+      uart_log("  AT -> no response (check baud rate / UART wiring).\r\n");
+      uart_log("  HINT: A7670G default baud is 115200 but may auto-baud.\r\n");
+  }
+
+  uart_log("=== UART Test Done ===\r\n\r\n");
+  HAL_Delay(100);
+  /* UART note: The A7670G echoes the AT command back before replying OK, so 
+  lte_rx will contain AT\r\nOK\r\n. The strstr check handles this correctly. */
   /* USER CODE END 2 */
 
   /* Infinite loop */
