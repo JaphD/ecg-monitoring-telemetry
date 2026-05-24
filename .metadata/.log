@@ -1,0 +1,112 @@
+!SESSION 2026-05-23 13:22:07.926 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Framework arguments:  C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.project
+Command-line arguments:  -os win32 -ws win32 -arch x86_64 C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.project
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-23 13:23:07.952
+!MESSAGE Log4j2 initialized with config file C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-23 13:23:12.950
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:23:18.382
+!MESSAGE Executed PowerShell command powershell.exe -Command "Get-CimInstance -ClassName Win32_SerialPort | Select-Object -ExpandProperty DeviceID":
+
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:23:18.382
+!MESSAGE port: 
+!SESSION 2026-05-23 13:25:26.884 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Command-line arguments:  -os win32 -ws win32 -arch x86_64
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-23 13:25:37.146
+!MESSAGE Log4j2 initialized with config file C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-23 13:25:41.685
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:25:43.382
+!MESSAGE Executed PowerShell command powershell.exe -Command "Get-CimInstance -ClassName Win32_SerialPort | Select-Object -ExpandProperty DeviceID":
+
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:25:43.383
+!MESSAGE port: 
+!SESSION 2026-05-23 13:28:57.293 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Framework arguments:  C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.cproject
+Command-line arguments:  -os win32 -ws win32 -arch x86_64 C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.cproject
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-23 13:29:16.943
+!MESSAGE Log4j2 initialized with config file C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-23 13:29:21.226
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:29:33.619
+!MESSAGE Executed PowerShell command powershell.exe -Command "Get-CimInstance -ClassName Win32_SerialPort | Select-Object -ExpandProperty DeviceID":
+
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:29:33.621
+!MESSAGE port: 
+!SESSION 2026-05-23 13:30:01.548 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Framework arguments:  C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware Project\.cproject
+Command-line arguments:  -os win32 -ws win32 -arch x86_64 C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware Project\.cproject
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-23 13:30:14.481
+!MESSAGE Log4j2 initialized with config file C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware Project\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-23 13:30:18.140
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:31:33.901
+!MESSAGE Executed PowerShell command powershell.exe -Command "Get-CimInstance -ClassName Win32_SerialPort | Select-Object -ExpandProperty DeviceID":
+
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:31:33.902
+!MESSAGE port: 
+!SESSION 2026-05-23 13:34:21.487 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Framework arguments:  C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.project
+Command-line arguments:  -os win32 -ws win32 -arch x86_64 C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.project
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-05-23 13:34:33.761
+!MESSAGE Log4j2 initialized with config file C:\Users\Yafet\Desktop\Projects\Altium\Thesis\ECG\ECG_Monitoring_Design\Firmware\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-05-23 13:34:37.823
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:34:45.318
+!MESSAGE Executed PowerShell command powershell.exe -Command "Get-CimInstance -ClassName Win32_SerialPort | Select-Object -ExpandProperty DeviceID":
+
+
+!ENTRY com.st.stm32cube.ide.mpu.remote.serial 1 1 2026-05-23 13:34:45.319
+!MESSAGE port: 
+
+!ENTRY org.eclipse.core.jobs 2 2 2026-05-23 13:34:48.155
+!MESSAGE Job found still running after platform shutdown.  Jobs should be canceled by the plugin that scheduled them during shutdown: com.st.stm32cube.ide.mcu.ide.startup.ProductDbLoad$1 RUNNING
+	 at java.xml/com.sun.org.apache.xerces.internal.dom.DeepNodeListImpl.nextMatchingElementAfter(DeepNodeListImpl.java:172)
+	 at java.xml/com.sun.org.apache.xerces.internal.dom.DeepNodeListImpl.item(DeepNodeListImpl.java:146)
+	 at java.xml/com.sun.org.apache.xerces.internal.dom.DeepNodeListImpl.getLength(DeepNodeListImpl.java:116)
+	 at com.st.stm32cube.ide.mcu.productdb.core.TargetsDefinitionFileParser.getBoards(TargetsDefinitionFileParser.java:279)
+	 at com.st.stm32cube.ide.mcu.productdb.core.TargetsDefinitionFileParser.parse(TargetsDefinitionFileParser.java:114)
+	 at com.st.stm32cube.ide.mcu.productdb.MCUProductDbResources.loadSupportedTargets(MCUProductDbResources.java:151)
+	 at com.st.stm32cube.ide.mcu.productdb.MCUProductDbResources.<init>(MCUProductDbResources.java:68)
+	 at com.st.stm32cube.ide.mcu.productdb.MCUProductDbResources.getInstance(MCUProductDbResources.java:80)
+	 at com.st.stm32cube.ide.mcu.ide.startup.ProductDbLoad$1.run(ProductDbLoad.java:31)
+	 at org.eclipse.core.internal.jobs.Worker.run(Worker.java:63)

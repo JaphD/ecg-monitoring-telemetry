@@ -65,24 +65,11 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
-static void uart_log(const char *msg)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
-}
-
-/* Thin printf wrapper — max 128 chars per call */
-static void uart_printf(const char *fmt, ...)
-{
-    char buf[128];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    uart_log(buf);
-}
+/* Global buffer for Live Expressions viewing */
+char test_status[128] = "Initializing...";
 /* USER CODE END 0 */
 
 /**
@@ -119,59 +106,47 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* --- I2C Test: LIS3DH WHO_AM_I scan (tries both SA0 addresses) --- */
-  uart_log("\r\n=== I2C Test: LIS3DH ===\r\n");
+  snprintf(test_status, sizeof(test_status), "Starting LIS3DH I2C Test...");
+    HAL_Delay(100); /* Small delay if you are stepping through code */
 
-  /*
- * WHO_AM_I register = 0x0F, expected response = 0x33
- * SA0 = GND -> address 0x18 (7-bit), shifted to 0x30 for HAL
- * SA0 = VCC -> address 0x19 (7-bit), shifted to 0x32 for HAL
- */
-  const uint8_t lis3dh_addrs[2]   = { 0x18 << 1, 0x19 << 1 };
-  const char   *lis3dh_addr_names[2] = { "0x18 (SA0=GND)", "0x19 (SA0=VCC)" };
-  const uint8_t WHO_AM_I_REG       = 0x0F;
-  const uint8_t WHO_AM_I_EXPECTED  = 0x33;
-  uint8_t       who_am_i_val       = 0x00;
-  uint8_t       lis3dh_found       = 0;
+    /*
+     * WHO_AM_I register = 0x0F, expected response = 0x33
+     * SA0 = GND -> address 0x18 (7-bit), shifted to 0x30 for HAL
+     * SA0 = VCC -> address 0x19 (7-bit), shifted to 0x32 for HAL
+     */
+    const uint8_t lis3dh_addrs[2]   = { 0x18 << 1, 0x19 << 1 };
+    const char   *lis3dh_addr_names[2] = { "0x18 (SA0=GND)", "0x19 (SA0=VCC)" };
+    const uint8_t WHO_AM_I_REG       = 0x0F;
+    const uint8_t WHO_AM_I_EXPECTED  = 0x33;
+    uint8_t       who_am_i_val       = 0x00;
+    uint8_t       lis3dh_found       = 0;
 
-  for (int i = 0; i < 2; i++)
-  {
-      /* Write the register address */
-      HAL_StatusTypeDef wr = HAL_I2C_Master_Transmit(
-          &hi2c1, lis3dh_addrs[i], (uint8_t *)&WHO_AM_I_REG, 1, 10);
+    for (int i = 0; i < 2; i++)
+    {
+        /* Write the register address */
+        HAL_StatusTypeDef wr = HAL_I2C_Master_Transmit(&hi2c1, lis3dh_addrs[i], (uint8_t *)&WHO_AM_I_REG, 1, 10);
 
-      if (wr == HAL_OK)
-      {
-          /* Read 1 byte back */
-          HAL_StatusTypeDef rd = HAL_I2C_Master_Receive(
-              &hi2c1, lis3dh_addrs[i], &who_am_i_val, 1, 10);
+        if (wr == HAL_OK)
+        {
+            /* Read 1 byte back */
+            HAL_StatusTypeDef rd = HAL_I2C_Master_Receive(&hi2c1, lis3dh_addrs[i], &who_am_i_val, 1, 10);
 
-          if (rd == HAL_OK)
-          {
-              uart_printf("  ACK at %s | WHO_AM_I = 0x%02X -> %s\r\n",
-                  lis3dh_addr_names[i],
-                  who_am_i_val,
-                  (who_am_i_val == WHO_AM_I_EXPECTED) ? "PASS" : "FAIL (unexpected value)");
-              lis3dh_found = 1;
-          }
-      }
-      else
-      {
-          uart_printf("  No ACK at %s\r\n", lis3dh_addr_names[i]);
-      }
-  }
+            if (rd == HAL_OK)
+            {
+                if (who_am_i_val == WHO_AM_I_EXPECTED) {
+                    snprintf(test_status, sizeof(test_status), "PASS: LIS3DH at %s | ID: 0x%02X", lis3dh_addr_names[i], who_am_i_val);
+                    lis3dh_found = 1;
+                    break; /* Success! Stop checking the other address */
+                } else {
+                    snprintf(test_status, sizeof(test_status), "FAIL: Wrong ID at %s | Got: 0x%02X", lis3dh_addr_names[i], who_am_i_val);
+                }
+            }
+        }
+    }
 
-  if (!lis3dh_found)
-      uart_log("  I2C ERROR: LIS3DH not found on either address.\r\n");
-
-  uart_log("=== I2C Test Done ===\r\n\r\n");
-  HAL_Delay(100);
-  /* Expected serial output (SA0=GND case):
-  === I2C Test: LIS3DH ===
-  No ACK at 0x19 (SA0=VCC)
-  ACK at 0x18 (SA0=GND) | WHO_AM_I = 0x33 -> PASS
-=== I2C Test Done ===
-  */
+    if (!lis3dh_found) {
+        snprintf(test_status, sizeof(test_status), "ERROR: LIS3DH not found on either address.");
+    }
   /* USER CODE END 2 */
 
   /* Infinite loop */
