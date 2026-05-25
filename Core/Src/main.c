@@ -106,47 +106,48 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  snprintf(test_status, sizeof(test_status), "Starting LIS3DH I2C Test...");
-    HAL_Delay(100); /* Small delay if you are stepping through code */
+  /* --- LIS3DH Init --- */
+  uint8_t reg_val = 0;
 
-    /*
-     * WHO_AM_I register = 0x0F, expected response = 0x33
-     * SA0 = GND -> address 0x18 (7-bit), shifted to 0x30 for HAL
-     * SA0 = VCC -> address 0x19 (7-bit), shifted to 0x32 for HAL
-     */
-    const uint8_t lis3dh_addrs[2]   = { 0x18 << 1, 0x19 << 1 };
-    const char   *lis3dh_addr_names[2] = { "0x18 (SA0=GND)", "0x19 (SA0=VCC)" };
-    const uint8_t WHO_AM_I_REG       = 0x0F;
-    const uint8_t WHO_AM_I_EXPECTED  = 0x33;
-    uint8_t       who_am_i_val       = 0x00;
-    uint8_t       lis3dh_found       = 0;
+  // CTRL_REG1: ODR = 100Hz, all axes enabled (X, Y, Z)
+  // 0x57 = 0101 0111 -> ODR=100Hz, LPen=0, Zen=1, Yen=1, Xen=1
+  reg_val = 0x57;
+  HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x20, I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
 
-    for (int i = 0; i < 2; i++)
-    {
-        /* Write the register address */
-        HAL_StatusTypeDef wr = HAL_I2C_Master_Transmit(&hi2c1, lis3dh_addrs[i], (uint8_t *)&WHO_AM_I_REG, 1, 10);
+  // CTRL_REG4: ±2g, high-res mode, BDU enabled
+  // 0x88 = 1000 1000 -> BDU=1, FS=00 (±2g), HR=1
+  reg_val = 0x88;
+  HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x23, I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
 
-        if (wr == HAL_OK)
-        {
-            /* Read 1 byte back */
-            HAL_StatusTypeDef rd = HAL_I2C_Master_Receive(&hi2c1, lis3dh_addrs[i], &who_am_i_val, 1, 10);
+  HAL_Delay(100); // Wait for first conversion
 
-            if (rd == HAL_OK)
-            {
-                if (who_am_i_val == WHO_AM_I_EXPECTED) {
-                    snprintf(test_status, sizeof(test_status), "PASS: LIS3DH at %s | ID: 0x%02X", lis3dh_addr_names[i], who_am_i_val);
-                    lis3dh_found = 1;
-                    break; /* Success! Stop checking the other address */
-                } else {
-                    snprintf(test_status, sizeof(test_status), "FAIL: Wrong ID at %s | Got: 0x%02X", lis3dh_addr_names[i], who_am_i_val);
-                }
-            }
-        }
-    }
+  /* --- LIS3DH Read Loop --- */
+  int16_t raw_x, raw_y, raw_z;
+  uint8_t buf[6];
 
-    if (!lis3dh_found) {
-        snprintf(test_status, sizeof(test_status), "ERROR: LIS3DH not found on either address.");
-    }
+  while (1)
+  {
+      // 0x28 | 0x80 = auto-increment read starting from OUT_X_L
+      HAL_StatusTypeDef rd = HAL_I2C_Mem_Read(&hi2c1, 0x18 << 1,
+                                                0x28 | 0x80,
+                                                I2C_MEMADD_SIZE_8BIT,
+                                                buf, 6, 10);
+      if (rd == HAL_OK)
+      {
+          raw_x = (int16_t)(buf[1] << 8 | buf[0]) >> 4; // 12-bit in high-res
+          raw_y = (int16_t)(buf[3] << 8 | buf[2]) >> 4;
+          raw_z = (int16_t)(buf[5] << 8 | buf[4]) >> 4;
+
+          snprintf(test_status, sizeof(test_status),
+                   "X:%d Y:%d Z:%d", raw_x, raw_y, raw_z);
+      }
+      else
+      {
+          snprintf(test_status, sizeof(test_status), "ERROR: I2C read failed");
+      }
+
+      HAL_Delay(100); // ~10Hz refresh rate, easy to read in Live Expressions
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
