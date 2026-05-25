@@ -1,0 +1,6 @@
+../FATFS/Target/sd_diskio.c:60:16:SD_CheckStatus	2
+../FATFS/Target/sd_diskio.c:70:9:SD_initialize	2
+../FATFS/Target/sd_diskio.c:80:9:SD_status	1
+../FATFS/Target/sd_diskio.c:85:9:SD_read	3
+../FATFS/Target/sd_diskio.c:97:9:SD_write	3
+../FATFS/Target/sd_diskio.c:110:9:SD_ioctl	6

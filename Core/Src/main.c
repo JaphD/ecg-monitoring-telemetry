@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -41,6 +42,8 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+RTC_HandleTypeDef hrtc;
+
 SD_HandleTypeDef hsd1;
 
 SPI_HandleTypeDef hspi1;
@@ -58,6 +61,7 @@ static void MX_I2C1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -103,55 +107,106 @@ int main(void)
   MX_SDMMC1_SD_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
-  /* USER CODE BEGIN 2 */
-  HAL_SD_CardInfoTypeDef sd_card_info = {0};
+  MX_RTC_Init();
+  MX_FATFS_Init();
 
-  snprintf((char*)test_status, sizeof(test_status), "SD: Detecting...");
+  /* USER CODE BEGIN 2 */
+  FATFS fs;
+  FIL fil;
+  FRESULT fres;
+  char filename[32];
+  char csv_line[128];
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* --- Mount filesystem --- */
+  snprintf((char*)test_status, sizeof(test_status), "FatFS: Mounting...");
+  fres = f_mount(&fs, "", 1);
+  if (fres != FR_OK)
+  {
+      snprintf((char*)test_status, sizeof(test_status),
+               "FAIL: f_mount err=%d", fres);
+      goto log_end;
+  }
+
+  /* --- Build filename from RTC --- */
+  HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+  HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);  /* Must read date after time */
+
+  snprintf(filename, sizeof(filename),
+           "ECG_%02d%02d%02d_%02d%02d%02d.CSV",
+           2000 + sDate.Year, sDate.Month,  sDate.Date,
+           sTime.Hours,       sTime.Minutes, sTime.Seconds);
+
+  snprintf((char*)test_status, sizeof(test_status),
+           "FatFS: Creating %s", filename);
   HAL_Delay(500);
 
-  if (HAL_SD_GetCardInfo(&hsd1, &sd_card_info) != HAL_OK)
+  /* --- Open/create file --- */
+  fres = f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
+  if (fres != FR_OK)
   {
       snprintf((char*)test_status, sizeof(test_status),
-               "FAIL: SD card not detected");
+               "FAIL: f_open err=%d", fres);
+      goto log_end;
   }
-  else
+
+  /* --- Write CSV header --- */
+  f_puts("timestamp,accel_x,accel_y,accel_z,ecg\r\n", &fil);
+
+  /* --- Init LIS3DH --- */
+  uint8_t reg_val = 0x57;  /* ODR=100Hz, XYZ enabled */
+  HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x20, I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
+  reg_val = 0x88;           /* ±2g, high-res, BDU */
+  HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x23, I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
+  HAL_Delay(100);
+
+  snprintf((char*)test_status, sizeof(test_status),
+           "Logging: %s", filename);
+
+  /* --- Main logging loop --- */
+  uint32_t sample_count = 0;
+  uint8_t  accel_buf[6];
+  int16_t  raw_x, raw_y, raw_z;
+
+  while (1)
   {
-      snprintf((char*)test_status, sizeof(test_status),
-               "SD: %luMB Type:%lu State:%lu",
-               sd_card_info.LogBlockNbr / 2048UL,
-               sd_card_info.CardType,
-               (uint32_t)HAL_SD_GetCardState(&hsd1));
-      HAL_Delay(2000);  // pause so you can read the card info
+      /* Read LIS3DH XYZ */
+      HAL_I2C_Mem_Read(&hi2c1, 0x18 << 1, 0x28 | 0x80,
+                       I2C_MEMADD_SIZE_8BIT, accel_buf, 6, 10);
+      raw_x = (int16_t)(accel_buf[1] << 8 | accel_buf[0]) >> 4;
+      raw_y = (int16_t)(accel_buf[3] << 8 | accel_buf[2]) >> 4;
+      raw_z = (int16_t)(accel_buf[5] << 8 | accel_buf[4]) >> 4;
 
-      const uint32_t TEST_BLOCK = 100UL;
-      uint8_t write_buf[512];
-      for (int i = 0; i < 512; i++)
-          write_buf[i] = (uint8_t)(i & 0xFF);
-      // Wait for card to be ready before writing
-      uint32_t timeout = HAL_GetTick() + 2000;
-      while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+      /* Read ECG — placeholder, replace with your ADC read */
+      uint16_t ecg_val = 0;  /* TODO: replace with HAL_ADC_GetValue() */
+
+      /* Get current timestamp */
+      HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+      HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+
+      /* Write CSV row */
+      snprintf(csv_line, sizeof(csv_line),
+               "%02d:%02d:%02d,%d,%d,%d,%u\r\n",
+               sTime.Hours, sTime.Minutes, sTime.Seconds,
+               raw_x, raw_y, raw_z, ecg_val);
+      f_puts(csv_line, &fil);
+      sample_count++;
+
+      /* Flush every 100 samples (~1 second at 100Hz) to protect against power loss */
+      if (sample_count % 100 == 0)
       {
-          if (HAL_GetTick() > timeout) break;
-          HAL_Delay(10);
-      }
-      HAL_StatusTypeDef wr = HAL_SD_WriteBlocks(
-          &hsd1, write_buf, TEST_BLOCK, 1, 10000); //10 seconds
-
-      /* Capture the exact error code from the SD handle */
-      uint32_t sd_error = HAL_SD_GetError(&hsd1);
-
-      if (wr != HAL_OK)
-      {
+          f_sync(&fil);
           snprintf((char*)test_status, sizeof(test_status),
-                   "FAIL: Write err=0x%08lX state=%lu",
-                   sd_error,
-                   (uint32_t)HAL_SD_GetCardState(&hsd1));
+                   "Logging: %lu samples", sample_count);
       }
-      else
-      {
-          snprintf((char*)test_status, sizeof(test_status), "PASS: Write OK");
-      }
+
+      HAL_Delay(10);  /* 100Hz */
   }
+
+  log_end:
+      f_close(&fil);
+      f_mount(NULL, "", 0);  /* unmount */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -189,8 +244,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_LSE
+                              |RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.MSICalibrationValue = 0;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
@@ -274,27 +331,102 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+  /* Only set time/date on first boot (backup register 0 not yet set) */
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) != 0xBEEF)
+  {
+      sTime.Hours   = 0x14;  /* 14:00:00 - adjust to your local time */
+      sTime.Minutes = 0x00;
+      sTime.Seconds = 0x00;
+      sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+      sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+      HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD);
+
+      sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+      sDate.Month   = RTC_MONTH_MAY;
+      sDate.Date    = 0x25;
+      sDate.Year    = 0x26;  /* 2026 in BCD */
+      HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD);
+
+      /* Mark as initialised so we don't reset time on next boot */
+      HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, 0xBEEF);
+  }
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
   * @brief SDMMC1 Initialization Function
   * @param None
   * @retval None
   */
 static void MX_SDMMC1_SD_Init(void)
 {
-
-  /* USER CODE BEGIN SDMMC1_Init 0 */
-
-  /* USER CODE END SDMMC1_Init 0 */
-
-  /* USER CODE BEGIN SDMMC1_Init 1 */
-
-  /* USER CODE END SDMMC1_Init 1 */
   hsd1.Instance = SDMMC1;
   hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
   hsd1.Init.ClockBypass = SDMMC_CLOCK_BYPASS_DISABLE;
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 7;
+  hsd1.Init.ClockDiv = 7;  /* Safe limit with 10k pull-ups */
+  /* USER CODE BEGIN SDMMC1_Init 2 */
   if (HAL_SD_Init(&hsd1) != HAL_OK)
   {
     Error_Handler();
@@ -303,10 +435,7 @@ static void MX_SDMMC1_SD_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SDMMC1_Init 2 */
-
   /* USER CODE END SDMMC1_Init 2 */
-
 }
 
 /**
