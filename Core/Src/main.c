@@ -21,7 +21,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,21 +67,8 @@ static void MX_USART1_UART_Init(void);
 #include <string.h>
 #include <stdio.h>
 
-static void uart_log(const char *msg)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
-}
-
-/* Thin printf wrapper — max 128 chars per call */
-static void uart_printf(const char *fmt, ...)
-{
-    char buf[128];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    uart_log(buf);
-}
+/* Global buffer for Live Expressions viewing */
+volatile char test_status[128] = "Initializing...";
 /* USER CODE END 0 */
 
 /**
@@ -119,52 +105,52 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  uart_log("=== SPI Test: ADS1292 ===\r\n");
+  /* ---------- 1. Power-up with RESET/PWDN HIGH first ---------- */
+  snprintf(test_status, sizeof(test_status), "ADS1292R: Power-up sequence...");
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);   /* CS high              */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   /* RESET/PWDN HIGH      */
+  HAL_Delay(2000);                                       /* 2 s power stabilise  */
 
-  /*
-  * CS  = PA4 (active LOW, software NSS)
-  * ADS1292 RREG command: 0x20 | reg_addr, then 0x00 (n_regs-1), then dummy read
-  * ID register (0x00) should return 0x73 for ADS1292
-  *
-  * Timing: CS low -> 4us min before SCLK, CPOL=0, CPHA=1 (Mode 1)
-  * Note: CubeMX configured SPI1 as CPHA=1EDGE (Mode 0). If you get 0xFF
-  *       every time, you may need to change CLKPhase to SPI_PHASE_2EDGE in
-  *       MX_SPI1_Init to match the ADS1292's required Mode 1.
-  */
+  /* ---------- 2. Toggle RESET/PWDN: HIGH -> LOW -> HIGH ---------- */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_Delay(100);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET); /* Pull LOW briefly     */
+  HAL_Delay(100);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);   /* Release HIGH         */
+  HAL_Delay(200);                                        /* Settle               */
 
-  /* CS low */
+  /* ---------- 3. Send SDATAC ---------- */
+  snprintf(test_status, sizeof(test_status), "ADS1292R: Sending SDATAC...");
+  const uint8_t SDATAC = 0x11;
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-  HAL_Delay(1);  /* tCSS: CS setup time */
+  HAL_Delay(2);
+  HAL_SPI_Transmit(&hspi1, (uint8_t *)&SDATAC, 1, 10);
+  HAL_Delay(2);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_Delay(200);                                        /* Give device time to process */
 
-  uint8_t ads_tx[3] = { 0x20, 0x00, 0x00 };  /* RREG reg=0x00, count=0 (1 byte), dummy */
-  uint8_t ads_rx[3] = { 0x00, 0x00, 0x00 };
+  /* ---------- 4. Read ID ---------- */
+  snprintf(test_status, sizeof(test_status), "ADS1292R: Reading ID register...");
+  const uint8_t RREG_ID[2] = { 0x20, 0x00 };
+  const uint8_t dummy      = 0x00;
+  uint8_t       id_val     = 0x00;
 
-  HAL_StatusTypeDef spi_status = HAL_SPI_TransmitReceive(
-      &hspi1, ads_tx, ads_rx, 3, 50);
-
-  /* CS high */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_Delay(2);
+  HAL_SPI_Transmit(&hspi1, (uint8_t *)RREG_ID, 2, 10);
+  HAL_Delay(2);
+  HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&dummy, &id_val, 1, 10);
+  HAL_Delay(2);
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 
-  if (spi_status == HAL_OK)
-  {
-      uint8_t ads_id = ads_rx[2];  /* Response byte comes on 3rd clock cycle */
-      uart_printf("  SPI HAL_OK | ADS1292 ID = 0x%02X -> %s\r\n",
-          ads_id,
-          (ads_id == 0x73) ? "PASS" : "FAIL (expected 0x73)");
-      if (ads_id == 0xFF)
-          uart_log("  HINT: 0xFF may mean MISO floating or wrong SPI Mode.\r\n");
-  }
+  /* ---------- 5. Validate ---------- */
+  if (id_val == 0x73)
+      snprintf(test_status, sizeof(test_status), "PASS: ADS1292R | ID: 0x%02X", id_val);
+  else if (id_val == 0x72)
+      snprintf(test_status, sizeof(test_status), "PASS: ADS1292 (non-R) | ID: 0x%02X", id_val);
   else
-  {
-      uart_log("  SPI ERROR: HAL_SPI_TransmitReceive failed.\r\n");
-  }
-
-  uart_log("=== SPI Test Done ===\r\n\r\n");
-  HAL_Delay(100);
-  /*Note on SPI mode: The ADS1292 requires SPI Mode 1 (CPOL=0, CPHA=1). 
-  CubeMX generated SPI_PHASE_1EDGE which is Mode 0. If the ID comes back as 0xFF,
-  go to MX_SPI1_Init and change hspi1.Init.CLKPhase to SPI_PHASE_2EDGE, then 
-  regenerate or edit manually.*/
+      snprintf(test_status, sizeof(test_status),
+               "FAIL: ID: 0x%02X | expected 0x73", id_val);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -343,9 +329,9 @@ static void MX_SPI1_Init(void)
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
