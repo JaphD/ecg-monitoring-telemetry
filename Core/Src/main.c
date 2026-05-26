@@ -21,7 +21,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,24 +64,11 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
-static void uart_log(const char *msg)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
-}
-
-/* Thin printf wrapper — max 128 chars per call */
-static void uart_printf(const char *fmt, ...)
-{
-    char buf[128];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    uart_log(buf);
-}
+/* Global buffer for Live Expressions viewing */
+volatile char test_status[128] = "Initializing...";
 /* USER CODE END 0 */
 
 /**
@@ -119,51 +105,110 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* --- UART Test: A7670G LTE Module (PB8 load switch) --- */
-  uart_log("=== UART Test: A7670G ===\r\n");
+  /* =========================================================
+   * A7670G-LABC Power-Up & UART Communication Test
+   *
+   * Hardware mapping:
+   *   PB8  -> Load switch EN  (TPS22969DNYR) - direct, active HIGH
+   *   PB2  -> PWRKEY via NPN (MMBT3904): MCU HIGH = A7670G PWRKEY LOW
+   *   PB1  -> RESET  via NPN (MMBT3904): MCU HIGH = A7670G RESET LOW
+   *   USART1 -> A7670G UART (115200 8N1)
+   * ========================================================= */
+  /* Override: ensure RESET is asserted before any sequencing begins.
+   * MX_GPIO_Init sets PB1 LOW (NPN OFF = RESET released) by default. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_Delay(10); /* Settle */
 
-  /*
-  * PB8 = HIGH -> load switch ON -> A7670G powered from LiPo
-  * Wait 3s for module boot before sending AT
-  */
-  uart_log("  Enabling A7670G via PB8 load switch...\r\n");
+  /* ---------- 1. Safe idle state before power ---------- */
+  snprintf(test_status, sizeof(test_status), "A7670G: Setting safe idle state...");
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); /* Load switch OFF         */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   /* RESET asserted (NPN ON) */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* PWRKEY idle (NPN OFF)   */
+  HAL_Delay(100);
+
+  /* ---------- 2. Enable load switch -> apply VBAT ---------- */
+  snprintf(test_status, sizeof(test_status), "A7670G: Enabling load switch (PB8)...");
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-  HAL_Delay(3000);  /* Module boot time: ~1-3s typical */
+  HAL_Delay(500); /* Allow supply rails to stabilise */
 
-  const char   *at_cmd       = "AT\r\n";
-  uint8_t       lte_rx[64]   = {0};
-  uint16_t      lte_rx_len   = 0;
+  /* ---------- 3. Release RESET ---------- */
+  snprintf(test_status, sizeof(test_status), "A7670G: Releasing RESET (PB1 LOW -> NPN OFF)...");
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); /* NPN OFF = RESET pin HIGH = released */
+  HAL_Delay(100);
 
-  /* Send AT command */
-  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 100);
-  HAL_Delay(500);  /* Give module time to respond */
+  /* ---------- 4. Pulse PWRKEY to boot the module ----------
+   * A7670G needs PWRKEY held LOW >= 500 ms.
+   * MCU PB2 HIGH -> NPN ON -> A7670G PWRKEY LOW.            */
+  snprintf(test_status, sizeof(test_status), "A7670G: Asserting PWRKEY for 600 ms...");
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);   /* NPN ON  = PWRKEY LOW */
+  HAL_Delay(600);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* NPN OFF = PWRKEY HIGH (released) */
 
-  /* Non-blocking poll: read whatever arrived */
-  HAL_StatusTypeDef lte_status = HAL_UART_Receive(
-      &huart1, lte_rx, sizeof(lte_rx) - 1, 1000);
+  /* ---------- 5. Wait for module boot ---------- */
+  snprintf(test_status, sizeof(test_status), "A7670G: Waiting for module boot (~5 s)...");
+  HAL_Delay(5000);
 
-  /* HAL_TIMEOUT is normal here — it means the timeout expired after
-    partial data; check for "OK" in whatever was received anyway */
-  lte_rx[sizeof(lte_rx) - 1] = '\0';
+  /* ---------- 6. UART AT echo test ---------- */
+  /* ---------- 6. UART AT echo test ---------- */
+  __HAL_UART_CLEAR_OREFLAG(&huart1);
+  __HAL_UART_CLEAR_NEFLAG(&huart1);
+  __HAL_UART_CLEAR_FEFLAG(&huart1);
 
-  if (strstr((char *)lte_rx, "OK") != NULL)
+  const char at_cmd[]   = "AT\r\n";
+  uint8_t    rx_buf[16] = {0};
+  uint8_t    uart_passed = 0;
+
+  /* First AT trains the autobaud — discard the response */
+  snprintf(test_status, sizeof(test_status), "A7670G: Autobaud training...");
+  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 500);
+  HAL_Delay(500);
+
+  /* Flush anything the module sent back during training */
+  __HAL_UART_CLEAR_OREFLAG(&huart1);
+  HAL_UART_Receive(&huart1, rx_buf, sizeof(rx_buf) - 1, 500);
+  memset(rx_buf, 0, sizeof(rx_buf));
+
+  /* Now send the real AT and expect OK */
+  snprintf(test_status, sizeof(test_status), "A7670G: Sending AT command...");
+  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 500);
+
+  HAL_StatusTypeDef rx_ret = HAL_UART_Receive(&huart1,
+                                 rx_buf,
+                                 sizeof(rx_buf) - 1,
+                                 2000);
+
+  if (rx_ret == HAL_OK || rx_ret == HAL_TIMEOUT)
   {
-      uart_log("  AT -> OK received: PASS\r\n");
-  }
-  else if (lte_status == HAL_OK || lte_rx[0] != '\0')
-  {
-      uart_printf("  AT -> unexpected response: [%s]\r\n", lte_rx);
+      if (strstr((char *)rx_buf, "OK") != NULL)
+      {
+          snprintf(test_status, sizeof(test_status),
+                   "PASS: A7670G responded OK | RX: \"%s\"", rx_buf);
+          uart_passed = 1;
+      }
+      else
+      {
+          snprintf(test_status, sizeof(test_status),
+                   "FAIL: No OK | RX bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
+                   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3],
+                   rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]);
+      }
   }
   else
   {
-      uart_log("  AT -> no response (check baud rate / UART wiring).\r\n");
-      uart_log("  HINT: A7670G default baud is 115200 but may auto-baud.\r\n");
+      snprintf(test_status, sizeof(test_status),
+               "FAIL: RX error (HAL status %d)", (int)rx_ret);
   }
 
-  uart_log("=== UART Test Done ===\r\n\r\n");
-  HAL_Delay(100);
-  /* UART note: The A7670G echoes the AT command back before replying OK, so 
-  lte_rx will contain AT\r\nOK\r\n. The strstr check handles this correctly. */
+  if (!uart_passed)
+  {
+      if (strncmp((const char *)test_status, "PASS", 4) != 0)
+      {
+          snprintf(test_status, sizeof(test_status),
+                   "ERROR: A7670G UART test FAILED.");
+      }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
