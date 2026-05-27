@@ -59,7 +59,7 @@ static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+uint8_t Send_AT_Command(const char* cmd, const char* expected_response, uint32_t timeout);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -69,6 +69,7 @@ static void MX_USART1_UART_Init(void);
 
 /* Global buffer for Live Expressions viewing */
 volatile char test_status[128] = "Initializing...";
+volatile char last_modem_response[128] = {0}; // Add this line here!
 /* USER CODE END 0 */
 
 /**
@@ -106,120 +107,100 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* =========================================================
-   * A7670G-LABC Power-Up & UART Communication Test
-   *
-   * Hardware mapping:
-   *   PB8  -> Load switch EN  (TPS22969DNYR) - direct, active HIGH
-   *   PB2  -> PWRKEY via NPN (MMBT3904): MCU HIGH = A7670G PWRKEY LOW
-   *   PB1  -> RESET  via NPN (MMBT3904): MCU HIGH = A7670G RESET LOW
-   *   USART1 -> A7670G UART (115200 8N1)
-   * ========================================================= */
-  /* Override: ensure RESET is asserted before any sequencing begins.
-   * MX_GPIO_Init sets PB1 LOW (NPN OFF = RESET released) by default. */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
-  HAL_Delay(10); /* Settle */
+     * A7670G Power-Up & Diagnostics Sequence (No Load Switch)
+     *
+     * Hardware mapping:
+     * PB2  -> PWRKEY via NPN (MMBT3904): MCU HIGH = A7670G PWRKEY LOW
+     * PB1  -> RESET  via NPN (MMBT3904): MCU HIGH = A7670G RESET LOW
+     * USART1 -> A7670G UART (115200 8N1)
+     * ========================================================= */
 
-  /* ---------- 1. Safe idle state before power ---------- */
-  snprintf(test_status, sizeof(test_status), "A7670G: Setting safe idle state...");
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); /* Load switch OFF         */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   /* RESET asserted (NPN ON) */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* PWRKEY idle (NPN OFF)   */
-  HAL_Delay(100);
+    /* ---------- 1. Safe idle state on startup ---------- */
+    snprintf((char *)test_status, sizeof(test_status), "A7670G: Initializing pins...");
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); /* Release RESET (NPN OFF -> Internal Pull-up) */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* Release PWRKEY (NPN OFF) */
+    HAL_Delay(500); /* Allow internal module voltages to stabilize */
 
-  /* ---------- 2. Enable load switch -> apply VBAT ---------- */
-  snprintf(test_status, sizeof(test_status), "A7670G: Enabling load switch (PB8)...");
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-  HAL_Delay(500); /* Allow supply rails to stabilise */
+    /* ---------- 2. Pulse PWRKEY to boot the module ---------- */
+    snprintf((char *)test_status, sizeof(test_status), "A7670G: Pulsing PWRKEY...");
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);   /* NPN ON  = PWRKEY pulled to GND */
+    HAL_Delay(600);                                       /* A7670G requires >500ms to register */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* NPN OFF = PWRKEY floating high */
 
-  /* ---------- 3. Release RESET ---------- */
-  snprintf(test_status, sizeof(test_status), "A7670G: Releasing RESET (PB1 LOW -> NPN OFF)...");
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); /* NPN OFF = RESET pin HIGH = released */
-  HAL_Delay(100);
+    /* ---------- 3. Wait for module internal OS boot ---------- */
+    snprintf((char *)test_status, sizeof(test_status), "A7670G: Waiting for boot (~5s)...");
+    HAL_Delay(5000);
 
-  /* ---------- 4. Pulse PWRKEY to boot the module ----------
-   * A7670G needs PWRKEY held LOW >= 500 ms.
-   * MCU PB2 HIGH -> NPN ON -> A7670G PWRKEY LOW.            */
-  snprintf(test_status, sizeof(test_status), "A7670G: Asserting PWRKEY for 600 ms...");
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);   /* NPN ON  = PWRKEY LOW */
-  HAL_Delay(600);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* NPN OFF = PWRKEY HIGH (released) */
+    /* ---------- 4. Establish UART Link ---------- */
+    snprintf((char *)test_status, sizeof(test_status), "A7670G: Syncing UART Link...");
 
-  /* ---------- 5. Wait for module boot ---------- */
-  snprintf(test_status, sizeof(test_status), "A7670G: Waiting for module boot (~5 s)...");
-  HAL_Delay(5000);
+    // Send a quick series of AT commands to train the module's auto-baud rate detector
+    Send_AT_Command("AT\r\n", "OK", 1000);
+    HAL_Delay(100);
 
-  /* ---------- 6. UART AT echo test ---------- */
-  /* ---------- 6. UART AT echo test ---------- */
-  __HAL_UART_CLEAR_OREFLAG(&huart1);
-  __HAL_UART_CLEAR_NEFLAG(&huart1);
-  __HAL_UART_CLEAR_FEFLAG(&huart1);
+    if (Send_AT_Command("AT\r\n", "OK", 2000))
+    {
+        /* ---------- 5. Check Signal Quality ---------- */
+        snprintf((char *)test_status, sizeof(test_status), "A7670G: Checking Signal (CSQ)...");
+        if (Send_AT_Command("AT+CSQ\r\n", "OK", 2000))
+        {
+            snprintf((char *)test_status, sizeof(test_status), "PASS: Link & Signal Ok!");
+            HAL_Delay(1000);
 
-  const char at_cmd[]   = "AT\r\n";
-  uint8_t    rx_buf[16] = {0};
-  uint8_t    uart_passed = 0;
+            /* ---------- 6. Initialize HTTP Service ---------- */
+            snprintf((char *)test_status, sizeof(test_status), "A7670G: Init HTTP...");
+            Send_AT_Command("AT+HTTPINIT\r\n", "OK", 3000);
 
-  /* First AT trains the autobaud — discard the response */
-  snprintf(test_status, sizeof(test_status), "A7670G: Autobaud training...");
-  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 500);
-  HAL_Delay(500);
+            /* ---------- 7. Link HTTP to PDP Context 1 ---------- */
+            snprintf((char *)test_status, sizeof(test_status), "A7670G: Linking Context...");
+            Send_AT_Command("AT+HTTPPARA=\"CID\",1\r\n", "OK", 3000);
 
-  /* Flush anything the module sent back during training */
-  __HAL_UART_CLEAR_OREFLAG(&huart1);
-  HAL_UART_Receive(&huart1, rx_buf, sizeof(rx_buf) - 1, 500);
-  memset(rx_buf, 0, sizeof(rx_buf));
+            /* ---------- 8. Set Target URL ---------- */
+            snprintf((char *)test_status, sizeof(test_status), "A7670G: Setting URL...");
+            Send_AT_Command("AT+HTTPPARA=\"URL\",\"http://httpbin.org/get\"\r\n", "OK", 3000);
 
-  /* Now send the real AT and expect OK */
-  snprintf(test_status, sizeof(test_status), "A7670G: Sending AT command...");
-  HAL_UART_Transmit(&huart1, (uint8_t *)at_cmd, strlen(at_cmd), 500);
+            /* ---------- 9. Trigger Asynchronous HTTP GET ---------- */
+            snprintf((char *)test_status, sizeof(test_status), "A7670G: Requesting GET...");
+            if (Send_AT_Command("AT+HTTPACTION=0\r\n", "+HTTPACTION:", 35000))
+            {
+                snprintf((char *)test_status, sizeof(test_status), "PASS: Server Responded!");
+                HAL_Delay(500);
 
-  HAL_StatusTypeDef rx_ret = HAL_UART_Receive(&huart1,
-                                 rx_buf,
-                                 sizeof(rx_buf) - 1,
-                                 2000);
+                /* ---------- 10. Read Content Payload ---------- */
+                Send_AT_Command("AT+HTTPREAD=0,500\r\n", "OK", 5000);
+                snprintf((char *)test_status, sizeof(test_status), "PASS: Cycle Complete!");
+            }
+            else
+            {
+                snprintf((char *)test_status, sizeof(test_status), "FAIL: HTTP Timeout.");
+            }
 
-  if (rx_ret == HAL_OK || rx_ret == HAL_TIMEOUT)
-  {
-      if (strstr((char *)rx_buf, "OK") != NULL)
-      {
-          snprintf(test_status, sizeof(test_status),
-                   "PASS: A7670G responded OK | RX: \"%s\"", rx_buf);
-          uart_passed = 1;
-      }
-      else
-      {
-          snprintf(test_status, sizeof(test_status),
-                   "FAIL: No OK | RX bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
-                   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3],
-                   rx_buf[4], rx_buf[5], rx_buf[6], rx_buf[7]);
-      }
-  }
-  else
-  {
-      snprintf(test_status, sizeof(test_status),
-               "FAIL: RX error (HAL status %d)", (int)rx_ret);
-  }
+            /* ---------- 11. Clean up HTTP Stack ---------- */
+            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
+        }
+        else
+        {
+            snprintf((char *)test_status, sizeof(test_status), "FAIL: Bad Signal Response.");
+        }
+    }
+    else
+    {
+        snprintf((char *)test_status, sizeof(test_status), "FAIL: Link lost.");
+    }
 
-  if (!uart_passed)
-  {
-      if (strncmp((const char *)test_status, "PASS", 4) != 0)
-      {
-          snprintf(test_status, sizeof(test_status),
-                   "ERROR: A7670G UART test FAILED.");
-      }
-  }
-  /* USER CODE END 2 */
+    /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
+    /* Infinite loop */
+    /* USER CODE BEGIN WHILE */
+    while (1)
+    {
+      /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+      /* USER CODE BEGIN 3 */
+      // Keep processor alive for debugger view
+      HAL_Delay(100);
+    }
+    /* USER CODE END 3 */
 }
 
 /**
@@ -505,7 +486,50 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+uint8_t Send_AT_Command(const char* cmd, const char* expected_response, uint32_t timeout)
+{
+  uint32_t tickstart = HAL_GetTick();
+  uint16_t idx = 0;
+  uint8_t ch;
 
+  // 1. Clear out our global tracking buffer safely
+  memset((char *)last_modem_response, 0, sizeof(last_modem_response));
+
+  // 2. Clear any pending hardware fault flags
+  __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+
+  // 3. Transmit the AT command to the A7670G
+  HAL_UART_Transmit(&huart1, (uint8_t*)cmd, strlen(cmd), 1000);
+
+  // 4. Dynamic streaming byte-by-byte read loop
+  while ((HAL_GetTick() - tickstart) < timeout)
+  {
+    // Check for hardware errors inside the loop and clear them instantly
+    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
+      __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF);
+    }
+
+    // Try to grab 1 byte from the UART hardware register (short 10ms timeout per byte)
+    if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK)
+    {
+      // Append character if we have space left in our buffer
+      if (idx < (sizeof(last_modem_response) - 2))
+      {
+        last_modem_response[idx++] = (char)ch;
+        last_modem_response[idx] = '\0'; // Keep string null-terminated
+
+        // Early Exit Condition: Did we find our target phrase yet?
+        if (strstr((char *)last_modem_response, expected_response) != NULL)
+        {
+          return 1; // Success! Exit immediately
+        }
+      }
+    }
+  }
+
+  // If the loop finishes without finding the string, it's a true timeout
+  return 0;
+}
 /* USER CODE END 4 */
 
 /**
