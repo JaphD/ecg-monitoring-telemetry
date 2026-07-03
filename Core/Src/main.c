@@ -1,1016 +1,1544 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : ADS1292R ECG + LIS3DH IMU logger → SD card → A7670G upload
-  *
-  * Peripherals
-  * -----------
-  *  SPI1   - ADS1292R  (Mode 1: CPOL=0 CPHA=1, SPI_PHASE_2EDGE)
-  *           CS      -> PA4  (active-LOW, software NSS)
-  *           RESET   -> PC4  (active-LOW)
-  *           DRDY    -> PB9  (active-LOW, polled)
-  *
-  *  I2C1   - LIS3DH IMU  (7-bit addr 0x18, SA0 tied LOW)
-  *
-  *  SDMMC1 - microSD via FatFS  (4-bit bus, ClockDiv=7)
-  *
-  *  RTC    - timestamps in filenames and CSV rows
-  *           First-boot time set via backup-register sentinel 0xBEEF.
-  *
-  *  USART1 - A7670G modem (115200 8N1)
-  *
+/*
+ * SD-first ECG monitoring firmware
+ *
+ * Data flow:
+ *   ADS1292R DRDY ISR -> RAM ring -> active SD CSV -> closed .RDY files
+ *                                               -> A7670G HTTPS -> Node.js
+ *
+ * The SD card is the source of truth. A file is removed only after the modem
+ * reports HTTP 200. Failed socket attempts leave the file queued for later.
+ */
 
-  *  PB2    - PWRKEY via NPN (MCU HIGH = PWRKEY pulled to GND)
-  *  PB1    - RESET  via NPN (MCU HIGH = RESET  pulled to GND)
-  *
-  * Operational loop (runs forever)
-  * --------------------------------
-  *  1. Shut modem down via PWRKEY (if running)
-  *  2. Log ECG + IMU to SD card for LOG_DURATION_MS (3 min)
-  *  3. Close and mark CSV file with .RDY extension
-  *  4. Boot modem via PWRKEY pulse, UART sync
-  *  5. Upload CSV in ≤256 KB chunks via AT+HTTP*
-  *     - On success  : rename file to .DONE
-  *     - On failure  : retry up to UPLOAD_MAX_RETRIES times,
-  *                     then rename to .FAIL and continue
-  *  6. Shut modem down, go to step 2
-  *
-  * CSV columns
-  * -----------
-  *  timestamp, accel_x, accel_y, accel_z, ecg_ch1, ecg_ch2
-  *
-  * File naming
-  * -----------
-  *  ECG_YYYYMMDD_HHMMSS.RDY   (logging complete, awaiting upload)
-  *  ECG_YYYYMMDD_HHMMSS.DONE  (uploaded successfully)
-  *  ECG_YYYYMMDD_HHMMSS.FAIL  (all retries exhausted)
-  *
-  *  Collision avoidance: if the base name already exists a _N suffix
-  *  is appended (N = 1..99) before the extension.
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "fatfs.h"
 
-/* USER CODE BEGIN Includes */
-#include <string.h>
 #include <stdio.h>
-/* USER CODE END Includes */
+#include <string.h>
 
-/* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef  hi2c1;
-RTC_HandleTypeDef  hrtc;
 SD_HandleTypeDef   hsd1;
 SPI_HandleTypeDef  hspi1;
 UART_HandleTypeDef huart1;
 
-/* USER CODE BEGIN PV */
-/* Live-expression watch variable */
-volatile char test_status[128]        = "Initializing...";
-volatile char last_modem_response[256] = {0};
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_RTC_Init(void);
-uint8_t Send_AT_Command(const char* cmd, const char* expected_response, uint32_t timeout);
 
-/* USER CODE BEGIN PFP */
+#define SAMPLE_RING_CAPACITY       2048U
+#define SAMPLE_RING_MASK           (SAMPLE_RING_CAPACITY - 1U)
+#define SAMPLES_PER_FILE           2500U
+#define RECORD_SESSION_MAX_MS      12000U
+#define RECORD_PROGRESS_TIMEOUT_MS 3000U
+#define HTTP_MAX_ATTEMPTS          3U
+#define HTTP_RETRY_BACKOFF_MS      5000U
+#define UPLOAD_RETRY_IDLE_MS       60000U
+#define SD_RECORD_START_RETRY_MS   5000U
+#define ADS_START_MAX_ATTEMPTS     3U
+#define ADS_CONFIG1_250_SPS        0x01U
+#define ADS_DRDY_FALLBACK_MS       40U
+#define ADS_POLL_INTERVAL_MS       4U
+#define MAX_HTTPDATA_BYTES         100000U
+#define MODEM_APN                  "internet"
+#define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
+#define ACTIVE_LOG_NAME            "ACTIVE.TMP"
+#define CSV_HEADER                 "timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n"
 
-/* ===========================================================================
- *  COMPILE-TIME CONFIGURATION
- * ===========================================================================*/
-
-/** Total logging window per session (milliseconds). 3 minutes = 180 000 ms */
-#define LOG_DURATION_MS         180000UL
-
-/** Maximum bytes declared per AT+HTTPDATA call (logical POST limit).
- *  A7670G hard limit is 319 488; keep well below for safety.
- *  No RAM buffer of this size is allocated — data is streamed from SD. */
-#define UPLOAD_CHUNK_SIZE       (256UL * 1024UL)  /* 256 KB */
-
-/** Strip buffer: bytes read from SD and written to UART in one go.
- *  Must fit in RAM alongside FatFS buffers. 512 = one SD sector.    */
-#define UPLOAD_STRIP_SIZE       512U
-
-/** Number of full upload attempts before flagging a file as failed. */
-#define UPLOAD_MAX_RETRIES      3
-
-/** HTTP POST target.  Replace with your real endpoint. */
-#define UPLOAD_URL              "http://httpbin.org/post"
-
-/* ===========================================================================
- *  ADS1292R SPI HELPERS
- * ===========================================================================*/
-
-static inline void ADS_CS_Low(void)
+typedef struct
 {
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_Delay(1);
+    uint32_t tick_ms;
+    int32_t  ecg_ch1;
+    int32_t  ecg_ch2;
+    int16_t  accel_x;
+    int16_t  accel_y;
+    int16_t  accel_z;
+} SampleRecord;
+
+static SampleRecord sample_ring[SAMPLE_RING_CAPACITY];
+static volatile uint16_t ring_head = 0U;
+static volatile uint16_t ring_tail = 0U;
+static volatile int16_t latest_accel_x = 0;
+static volatile int16_t latest_accel_y = 0;
+static volatile int16_t latest_accel_z = 0;
+static volatile uint8_t acquisition_enabled = 0U;
+static uint8_t ads_has_started = 0U;
+
+static FIL log_file;
+static uint8_t log_open = 0U;
+static uint32_t log_rows = 0U;
+static uint32_t file_sequence = 1U;
+static volatile uint8_t upload_in_progress = 0U;
+static volatile uint8_t sd_upload_read_active = 0U;
+static uint32_t last_imu_tick = 0U;
+static uint32_t ads_last_poll_tick = 0U;
+
+static volatile char modem_rx[512];
+static volatile uint16_t modem_rx_len = 0U;
+static volatile uint8_t modem_rx_byte = 0U;
+static volatile uint8_t modem_rx_active = 0U;
+
+/* Live Expressions */
+volatile char system_status[128] = "Booting";
+volatile uint32_t system_phase = 0U;
+volatile uint32_t record_sessions_completed = 0U;
+volatile uint32_t upload_phases_completed = 0U;
+volatile uint32_t record_progress_timeouts = 0U;
+volatile uint32_t record_last_progress_tick = 0U;
+volatile uint32_t total_samples_acquired = 0U;
+volatile uint32_t total_samples_logged = 0U;
+volatile uint32_t sample_ring_overflows = 0U;
+volatile uint32_t sd_write_errors = 0U;
+volatile uint32_t sd_files_queued = 0U;
+volatile uint32_t queue_reconcile_events = 0U;
+volatile uint32_t sd_rotation_deferred = 0U;
+volatile uint32_t sd_sync_result = 0U;
+volatile uint32_t sd_sync_count = 0U;
+volatile uint32_t sd_sync_failures = 0U;
+volatile uint32_t sd_last_sync_tick = 0U;
+volatile uint32_t sd_last_sync_duration_ms = 0U;
+volatile uint32_t sd_close_result = 0U;
+volatile uint32_t sd_rename_result = 0U;
+volatile uint32_t sd_logger_write_fault = 0U;
+volatile uint32_t sd_last_write_result = 0U;
+volatile uint32_t sd_write_retry_tick = 0U;
+volatile uint32_t sd_drain_failures = 0U;
+volatile uint32_t logger_start_result = 0U;
+volatile uint32_t logger_start_failures = 0U;
+volatile uint32_t sd_remount_attempts = 0U;
+volatile uint32_t sd_remount_result = 0U;
+volatile uint32_t storage_prepare_result = 0U;
+volatile uint32_t storage_prepare_count = 0U;
+volatile uint32_t uploads_ok = 0U;
+volatile uint32_t uploads_failed = 0U;
+volatile uint32_t upload_stage = 0U;
+volatile uint32_t upload_bytes_sent = 0U;
+volatile uint32_t current_http_status = 0U;
+volatile uint32_t sd_unlink_result = 0U;
+volatile uint32_t upload_delete_failures = 0U;
+volatile uint32_t upload_oversize_files = 0U;
+volatile uint32_t last_http_status = 0U;
+volatile uint32_t last_upload_attempts = 0U;
+volatile uint32_t last_upload_file_size = 0U;
+volatile uint32_t uart_error_flags = 0U;
+volatile uint32_t uart_overruns = 0U;
+volatile uint32_t ads_drdy_irq_count = 0U;
+volatile uint32_t ads_spi_errors = 0U;
+volatile uint32_t ads_id_value = 0U;
+volatile uint32_t ads_config1_readback = 0U;
+volatile uint32_t ads_stream_stage = 0U;
+volatile uint32_t ads_drdy_pin_state = 1U;
+volatile uint32_t ads_bootstrap_capture_count = 0U;
+volatile uint32_t ads_capture_mode = 0U; /* 1=EXTI, 2=PB9 polling fallback */
+volatile uint32_t ads_poll_capture_count = 0U;
+volatile uint32_t ads_last_irq_tick = 0U;
+volatile uint32_t ads_start_attempts = 0U;
+volatile uint32_t ads_start_failures = 0U;
+volatile uint32_t modem_boot_stage = 0U;
+volatile char last_modem_response[512] = {0};
+volatile char modem_boot_failure[64] = {0};
+volatile char modem_boot_last_response[512] = {0};
+volatile char upload_failure_step[64] = {0};
+volatile char upload_failure_response[512] = {0};
+volatile char record_abort_reason[64] = {0};
+volatile char current_log_filename[32] = {0};
+volatile char current_upload_filename[32] = {0};
+
+static void Background_Service(void);
+static void ADS_CaptureFromISR(void);
+static void ADS_Service(void);
+static void Logger_RecoverQueue(void);
+static FRESULT Logger_SyncActiveFile(void);
+
+static uint8_t IsReadyFileName(const char *name)
+{
+    if ((name[0] != 'E') || (name[1] != 'C') || (name[2] != 'G')) return 0U;
+    for (uint32_t i = 3U; i < 8U; i++)
+    {
+        if ((name[i] < '0') || (name[i] > '9')) return 0U;
+    }
+    return ((name[8] == '.') &&
+            (name[9] == 'R') &&
+            (name[10] == 'D') &&
+            (name[11] == 'Y') &&
+            (name[12] == '\0')) ? 1U : 0U;
 }
 
-static inline void ADS_CS_High(void)
+static inline void ADS_CS(uint8_t active)
 {
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4,
+                      active ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
-static void ADS_SendCommand(uint8_t cmd)
+static void ADS_Command(uint8_t command)
 {
-    ADS_CS_Low();
-    HAL_SPI_Transmit(&hspi1, &cmd, 1, 10);
-    ADS_CS_High();
-    HAL_Delay(2);
+    ADS_CS(1U);
+    (void)HAL_SPI_Transmit(&hspi1, &command, 1U, 20U);
+    ADS_CS(0U);
+    HAL_Delay(2U);
 }
 
 static void ADS_WriteReg(uint8_t reg, uint8_t value)
 {
-    uint8_t cmd[2] = { (uint8_t)(0x40 | (reg & 0x1F)), 0x00 };
-    ADS_CS_Low();
-    HAL_SPI_Transmit(&hspi1, cmd,    2, 10);
-    HAL_SPI_Transmit(&hspi1, &value, 1, 10);
-    ADS_CS_High();
-    HAL_Delay(2);
+    uint8_t bytes[3] = {(uint8_t)(0x40U | (reg & 0x1FU)), 0U, value};
+    ADS_CS(1U);
+    (void)HAL_SPI_Transmit(&hspi1, bytes, sizeof(bytes), 20U);
+    ADS_CS(0U);
+    HAL_Delay(2U);
 }
 
 static uint8_t ADS_ReadReg(uint8_t reg)
 {
-    uint8_t cmd[2] = { (uint8_t)(0x20 | (reg & 0x1F)), 0x00 };
-    uint8_t dummy  = 0x00;
-    uint8_t result = 0x00;
-    ADS_CS_Low();
-    HAL_SPI_Transmit(&hspi1, cmd, 2, 10);
-    HAL_SPI_TransmitReceive(&hspi1, &dummy, &result, 1, 10);
-    ADS_CS_High();
-    HAL_Delay(2);
+    uint8_t command[2] = {(uint8_t)(0x20U | (reg & 0x1FU)), 0U};
+    uint8_t tx = 0U, value = 0U;
+    ADS_CS(1U);
+    (void)HAL_SPI_Transmit(&hspi1, command, 2U, 20U);
+    (void)HAL_SPI_TransmitReceive(&hspi1, &tx, &value, 1U, 20U);
+    ADS_CS(0U);
+    return value;
+}
+
+static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
+{
+    ads_stream_stage = 1U;
+    ads_capture_mode = 0U;
+    acquisition_enabled = 0U;
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    ADS_CS(0U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(10U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(2000U);
+
+    /* Full hardware-reset sequence validated by b3feab2/f2a0433. This is
+     * required when RESET/PWDN has remained low throughout a boot upload. */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(100U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(100U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(200U);
+
+    ADS_Command(0x11U); /* SDATAC */
+    HAL_Delay(200U);
+    ads_id_value = ADS_ReadReg(0x00U);
+    if ((ads_id_value & 0x7FU) != 0x73U)
+    {
+        ads_stream_stage = 255U;
+        return HAL_ERROR;
+    }
+    ads_stream_stage = 5U;
+
+    ADS_WriteReg(0x01U, ADS_CONFIG1_250_SPS); /* 250 SPS */
+    ADS_WriteReg(0x02U, 0xE0U);
+    ADS_WriteReg(0x03U, 0x10U);
+    ADS_WriteReg(0x04U, 0x00U);
+    ADS_WriteReg(0x05U, 0x00U);
+    ADS_WriteReg(0x06U, 0x2CU);
+    ADS_WriteReg(0x07U, 0x0FU);
+    ADS_WriteReg(0x09U, 0xEAU);
+    ADS_WriteReg(0x0AU, 0x03U);
+    ads_config1_readback = ADS_ReadReg(0x01U);
+    if (ads_config1_readback != ADS_CONFIG1_250_SPS)
+    {
+        ads_stream_stage = 255U;
+        return HAL_ERROR;
+    }
+    ads_stream_stage = 10U;
+
+    /* Use the sequence proven on this board in b3feab2/f2a0433: start the
+     * converter first, then enter continuous-read mode.  Sending START after
+     * RDATAC left the device responsive to register reads but produced no
+     * DRDY frames. */
+    ADS_Command(0x08U); /* START */
+    HAL_Delay(10U);
+    ADS_Command(0x10U); /* RDATAC */
+    HAL_Delay(10U);
+    ads_stream_stage = 20U;
+
+    /* PB9 may already be LOW by the time EXTI is armed. Drain that frame once
+     * to release DRDY, then enable falling-edge interrupts for every following
+     * conversion. */
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5U, 0U);
+    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_RESET)
+    {
+        ADS_CaptureFromISR();
+        ads_bootstrap_capture_count++;
+    }
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    acquisition_enabled = 1U;
+    ads_last_irq_tick = HAL_GetTick();
+    ads_capture_mode = 1U;
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+    ads_has_started = 1U;
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef ADS_StartAcquisition(void)
+{
+    for (uint32_t attempt = 1U; attempt <= ADS_START_MAX_ATTEMPTS; attempt++)
+    {
+        ads_start_attempts = attempt;
+        if (attempt > 1U)
+        {
+            (void)HAL_SPI_DeInit(&hspi1);
+            HAL_Delay(20U);
+            if (HAL_SPI_Init(&hspi1) != HAL_OK) continue;
+        }
+
+        if (ADS_ConfigureAndStartAttempt() == HAL_OK) return HAL_OK;
+
+        ads_start_failures++;
+        acquisition_enabled = 0U;
+        ads_has_started = 0U;
+        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+        ADS_CS(0U);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+        HAL_Delay(500U);
+    }
+    return HAL_ERROR;
+}
+
+static void ADS_StopAcquisition(void)
+{
+    acquisition_enabled = 0U;
+    ads_capture_mode = 0U;
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    if (!ads_has_started) return;
+    ADS_Command(0x11U); /* SDATAC */
+    ADS_Command(0x0AU); /* STOP */
+    ads_has_started = 0U;
+}
+
+static void ADS_CaptureFromISR(void)
+{
+    uint8_t tx[9] = {0};
+    uint8_t rx[9] = {0};
+    ADS_CS(1U);
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 9U, 2U);
+    ADS_CS(0U);
+    if (status != HAL_OK)
+    {
+        ads_spi_errors++;
+        return;
+    }
+
+    int32_t ch1 = ((int32_t)rx[3] << 16) | ((int32_t)rx[4] << 8) | rx[5];
+    int32_t ch2 = ((int32_t)rx[6] << 16) | ((int32_t)rx[7] << 8) | rx[8];
+    if ((ch1 & 0x00800000L) != 0) ch1 |= (int32_t)0xFF000000L;
+    if ((ch2 & 0x00800000L) != 0) ch2 |= (int32_t)0xFF000000L;
+
+    uint16_t head = ring_head;
+    uint16_t next = (uint16_t)((head + 1U) & SAMPLE_RING_MASK);
+    if (next == ring_tail)
+    {
+        sample_ring_overflows++;
+        return;
+    }
+
+    sample_ring[head].tick_ms = HAL_GetTick();
+    sample_ring[head].ecg_ch1 = ch1;
+    sample_ring[head].ecg_ch2 = ch2;
+    sample_ring[head].accel_x = latest_accel_x;
+    sample_ring[head].accel_y = latest_accel_y;
+    sample_ring[head].accel_z = latest_accel_z;
+    __DMB();
+    ring_head = next;
+    total_samples_acquired++;
+    if (total_samples_acquired >= 2U) ads_stream_stage = 100U;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_9)
+    {
+        ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+        ads_drdy_irq_count++;
+        ads_last_irq_tick = HAL_GetTick();
+        if (acquisition_enabled) ADS_CaptureFromISR();
+    }
+}
+
+/* The validated sensor firmware polls PB9. Keep EXTI as the normal fast path,
+ * but fall back to that proven behavior if no DRDY interrupt is observed for
+ * several expected frames at 250 SPS. */
+static void ADS_Service(void)
+{
+    if (!acquisition_enabled) return;
+
+    uint32_t now = HAL_GetTick();
+    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+
+    if ((ads_capture_mode == 1U) && ((now - ads_last_irq_tick) >= ADS_DRDY_FALLBACK_MS))
+    {
+        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+        ads_capture_mode = 2U;
+        ads_stream_stage = 30U;
+        ads_last_poll_tick = now;
+    }
+
+    if ((ads_capture_mode == 2U) && ((now - ads_last_poll_tick) >= ADS_POLL_INTERVAL_MS) &&
+        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_RESET))
+    {
+        ads_last_poll_tick = now;
+        ADS_CaptureFromISR();
+        ads_poll_capture_count++;
+    }
+}
+
+static HAL_StatusTypeDef LIS3DH_Init(void)
+{
+    uint8_t value = 0x47U;
+    if (HAL_I2C_Mem_Write(&hi2c1, 0x18U << 1, 0x20U,
+                          I2C_MEMADD_SIZE_8BIT, &value, 1U, 50U) != HAL_OK)
+        return HAL_ERROR;
+    value = 0x88U;
+    return HAL_I2C_Mem_Write(&hi2c1, 0x18U << 1, 0x23U,
+                             I2C_MEMADD_SIZE_8BIT, &value, 1U, 50U);
+}
+
+static void LIS3DH_Service(void)
+{
+    uint32_t now = HAL_GetTick();
+    if ((now - last_imu_tick) < 20U) return;
+    last_imu_tick = now;
+
+    uint8_t data[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, 0x18U << 1, 0xA8U,
+                         I2C_MEMADD_SIZE_8BIT, data, sizeof(data), 20U) == HAL_OK)
+    {
+        latest_accel_x = (int16_t)((data[1] << 8) | data[0]) >> 4;
+        latest_accel_y = (int16_t)((data[3] << 8) | data[2]) >> 4;
+        latest_accel_z = (int16_t)((data[5] << 8) | data[4]) >> 4;
+    }
+}
+
+static void MakePath(char *out, size_t out_size, const char *name)
+{
+    (void)snprintf(out, out_size, "%s%s", SDPath, name);
+}
+
+static void ReadyName(char *out, size_t out_size, uint32_t sequence)
+{
+    (void)snprintf(out, out_size, "ECG%05lu.RDY", (unsigned long)sequence);
+}
+
+static FRESULT Logger_OpenActive(void)
+{
+    char path[32];
+    MakePath(path, sizeof(path), ACTIVE_LOG_NAME);
+    FRESULT result = f_open(&log_file, path, FA_CREATE_ALWAYS | FA_WRITE);
+    if (result != FR_OK) return result;
+    log_open = 1U;
+    log_rows = 0U;
+    snprintf((char *)current_log_filename, sizeof(current_log_filename), "%s", path);
+    UINT written = 0U;
+    result = f_write(&log_file, CSV_HEADER, strlen(CSV_HEADER), &written);
+    if ((result != FR_OK) || (written != strlen(CSV_HEADER)))
+    {
+        sd_write_errors++;
+        sd_logger_write_fault = 1U;
+        sd_last_write_result = (uint32_t)result;
+        sd_write_retry_tick = HAL_GetTick();
+    }
     return result;
 }
 
-/**
- * @brief Full ADS1292R power-up, reset, and configuration sequence.
- * @return HAL_OK if device ID is valid, HAL_ERROR otherwise.
- */
-static HAL_StatusTypeDef ADS_Init(void)
+static FRESULT Logger_CloseAndQueue(uint8_t reopen)
 {
-    ADS_CS_High();
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_Delay(10);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(2000);
+    if (!log_open) return FR_INVALID_OBJECT;
 
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(200);
-
-    snprintf((char*)test_status, sizeof(test_status), "ADS1292R: SDATAC...");
-    ADS_SendCommand(0x11);
-    HAL_Delay(200);
-
-    snprintf((char*)test_status, sizeof(test_status), "ADS1292R: Reading ID...");
-    uint8_t id = ADS_ReadReg(0x00);
-
-    if (id == 0x73)
-        snprintf((char*)test_status, sizeof(test_status), "ADS1292R ID=0x%02X OK", id);
-    else if (id == 0x72)
-        snprintf((char*)test_status, sizeof(test_status), "ADS1292 (non-R) ID=0x%02X", id);
-    else
+    sd_sync_result = (uint32_t)Logger_SyncActiveFile();
+    if (sd_sync_result != (uint32_t)FR_OK)
     {
-        snprintf((char*)test_status, sizeof(test_status),
-                 "FAIL: ADS ID=0x%02X (expected 0x73)", id);
-        return HAL_ERROR;
+        sd_write_errors++;
+        sd_logger_write_fault = 1U;
+        sd_last_write_result = sd_sync_result;
+        sd_write_retry_tick = HAL_GetTick();
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD sync failed: %lu", (unsigned long)sd_sync_result);
+        return (FRESULT)sd_sync_result;
     }
 
-    ADS_WriteReg(0x01, 0x02); /* CONFIG1  : 500 SPS                  */
-    ADS_WriteReg(0x02, 0xE0); /* CONFIG2  : ref buf on, 2.42 V ref   */
-    ADS_WriteReg(0x03, 0x10); /* LOFF     : DC lead-off, 95% thr     */
-    ADS_WriteReg(0x04, 0x00); /* CH1SET   : gain=6, normal input      */
-    ADS_WriteReg(0x05, 0x00); /* CH2SET   : same as CH1               */
-    ADS_WriteReg(0x06, 0x2C); /* RLD_SENS : RLD from CH1+CH2          */
-    ADS_WriteReg(0x07, 0x0F); /* LOFF_SENS: all inputs                */
-    ADS_WriteReg(0x09, 0xEA); /* RESP1    : resp demod+mod on         */
-    ADS_WriteReg(0x0A, 0x03); /* RESP2    : RLDREF internal           */
-    HAL_Delay(10);
-
-    ADS_SendCommand(0x08); /* START  */
-    HAL_Delay(10);
-    ADS_SendCommand(0x10); /* RDATAC */
-    HAL_Delay(10);
-
-    snprintf((char*)test_status, sizeof(test_status), "ADS1292R: Init OK, streaming");
-    return HAL_OK;
-}
-
-/**
- * @brief Read one 9-byte frame from ADS1292R (RDATAC mode).
- *        Polls DRDY (PB9 active-LOW) with a 10 ms timeout.
- */
-static HAL_StatusTypeDef ADS_ReadData(int32_t *ch1, int32_t *ch2)
-{
-    uint32_t t_start = HAL_GetTick();
-    while (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET)
+    sd_close_result = (uint32_t)f_close(&log_file);
+    if (sd_close_result != (uint32_t)FR_OK)
     {
-        if ((HAL_GetTick() - t_start) > 10)
-            return HAL_TIMEOUT;
+        sd_write_errors++;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD close failed: %lu", (unsigned long)sd_close_result);
+        return (FRESULT)sd_close_result;
     }
+    log_open = 0U;
 
-    uint8_t rx[9] = {0};
-    uint8_t tx[9] = {0};
-    ADS_CS_Low();
-    HAL_SPI_TransmitReceive(&hspi1, tx, rx, 9, 20);
-    ADS_CS_High();
-
-    int32_t raw_ch1 = ((int32_t)rx[3] << 16) | ((int32_t)rx[4] << 8) | rx[5];
-    if (raw_ch1 & 0x00800000) raw_ch1 |= 0xFF000000;
-
-    int32_t raw_ch2 = ((int32_t)rx[6] << 16) | ((int32_t)rx[7] << 8) | rx[8];
-    if (raw_ch2 & 0x00800000) raw_ch2 |= 0xFF000000;
-
-    *ch1 = raw_ch1;
-    *ch2 = raw_ch2;
-    return HAL_OK;
-}
-
-/* ===========================================================================
- *  A7670G MODEM HELPERS
- * ===========================================================================*/
-
-/**
- * @brief Wake the A7670G by pulsing PWRKEY (board is USB-C powered;
- *        VBAT is always present — no load switch exists).
- *
- *        Sequence:
- *          1. Ensure PWRKEY and RESET lines are released (NPN OFF)
- *          2. Pulse PWRKEY LOW for 600 ms via NPN (MCU HIGH = PWRKEY GND)
- *          3. Wait ~5 s for the module OS to boot
- *          4. Auto-baud sync on USART1
- *
- * @return 1 if UART link established, 0 on failure.
- */
-static uint8_t Modem_PowerOn(void)
-{
-    snprintf((char*)test_status, sizeof(test_status), "Modem: Releasing control lines...");
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); /* RESET NPN OFF  */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* PWRKEY NPN OFF */
-    HAL_Delay(200);
-
-    snprintf((char*)test_status, sizeof(test_status), "Modem: PWRKEY pulse...");
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);   /* NPN ON  -> PWRKEY LOW */
-    HAL_Delay(600);                                        /* >500 ms required      */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* NPN OFF -> PWRKEY float */
-
-    snprintf((char*)test_status, sizeof(test_status), "Modem: Waiting for boot (~5s)...");
-    HAL_Delay(5000);
-
-    snprintf((char*)test_status, sizeof(test_status), "Modem: UART sync...");
-    Send_AT_Command("AT\r\n", "OK", 1000); /* Prime auto-baud */
-    HAL_Delay(100);
-    if (!Send_AT_Command("AT\r\n", "OK", 2000))
+    char source[32], ready_name[16], destination[32];
+    MakePath(source, sizeof(source), ACTIVE_LOG_NAME);
+    ReadyName(ready_name, sizeof(ready_name), file_sequence);
+    MakePath(destination, sizeof(destination), ready_name);
+    sd_rename_result = (uint32_t)f_rename(source, destination);
+    FRESULT result = (FRESULT)sd_rename_result;
+    if (result != FR_OK)
     {
-        snprintf((char*)test_status, sizeof(test_status), "FAIL: Modem UART link lost");
-        return 0;
-    }
-
-    snprintf((char*)test_status, sizeof(test_status), "Modem: Online");
-    return 1;
-}
-
-/**
- * @brief Shut down the A7670G cleanly via a long PWRKEY pulse (≥2 s).
- *        VBAT remains powered (USB-C supply); only the module is turned off.
- */
-static void Modem_PowerOff(void)
-{
-    snprintf((char*)test_status, sizeof(test_status), "Modem: Shutting down...");
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);   /* NPN ON  -> PWRKEY LOW */
-    HAL_Delay(2500);                                       /* >2 s triggers power-off */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* NPN OFF -> release      */
-    HAL_Delay(1000);                                       /* Allow module to settle  */
-    snprintf((char*)test_status, sizeof(test_status), "Modem: Off");
-}
-
-/**
- * @brief Transmit one AT command and poll for expected_response within timeout.
- * @return 1 if response found, 0 on timeout.
- */
-uint8_t Send_AT_Command(const char* cmd, const char* expected_response, uint32_t timeout)
-{
-    uint32_t tickstart = HAL_GetTick();
-    uint16_t idx = 0;
-    uint8_t  ch;
-
-    memset((char*)last_modem_response, 0, sizeof(last_modem_response));
-    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF | UART_CLEAR_NEF |
-                                   UART_CLEAR_FEF  | UART_CLEAR_PEF);
-    HAL_UART_Transmit(&huart1, (uint8_t*)cmd, strlen(cmd), 1000);
-
-    while ((HAL_GetTick() - tickstart) < timeout)
-    {
-        if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE))
-            __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF);
-
-        if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK)
+        sd_write_errors++;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD rename failed: %u", (unsigned)result);
+        /* Preserve the active data and retry rotation on a later pass. */
+        result = f_open(&log_file, source, FA_OPEN_EXISTING | FA_WRITE);
+        if (result == FR_OK)
         {
-            if (idx < (sizeof(last_modem_response) - 2))
+            result = f_lseek(&log_file, f_size(&log_file));
+            if (result == FR_OK) log_open = 1U;
+        }
+        sd_rotation_deferred = 1U;
+        return (FRESULT)sd_rename_result;
+    }
+    file_sequence++;
+    sd_files_queued++;
+    sd_rotation_deferred = 0U;
+    current_log_filename[0] = '\0';
+    if (reopen && (Logger_OpenActive() != FR_OK))
+    {
+        sd_write_errors++;
+        Error_Handler();
+    }
+    return result;
+}
+
+static FRESULT Logger_StartRecording(void)
+{
+    if (log_open) return FR_OK;
+    return Logger_OpenActive();
+}
+
+static FRESULT SD_RemountForLogger(void)
+{
+    sd_remount_attempts++;
+    (void)f_mount(NULL, SDPath, 0U);
+    (void)HAL_SD_DeInit(&hsd1);
+    HAL_Delay(20U);
+
+    if (HAL_SD_Init(&hsd1) != HAL_OK)
+    {
+        sd_remount_result = 1000U;
+        return FR_DISK_ERR;
+    }
+    if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B) != HAL_OK)
+    {
+        sd_remount_result = 1001U;
+        return FR_DISK_ERR;
+    }
+
+    FRESULT result = f_mount(&SDFatFS, SDPath, 1U);
+    sd_remount_result = (uint32_t)result;
+    if (result == FR_OK) Logger_RecoverQueue();
+    return result;
+}
+
+static FRESULT Logger_SyncActiveFile(void)
+{
+    uint32_t sync_start = HAL_GetTick();
+    sd_sync_count++;
+    sd_last_sync_tick = sync_start;
+    FRESULT result = f_sync(&log_file);
+    sd_last_sync_duration_ms = HAL_GetTick() - sync_start;
+    sd_sync_result = (uint32_t)result;
+    if (result != FR_OK) sd_sync_failures++;
+    return result;
+}
+
+static FRESULT Logger_StartRecordingWithRecovery(void)
+{
+    FRESULT result = Logger_StartRecording();
+    logger_start_result = (uint32_t)result;
+    if (result == FR_OK) return result;
+
+    logger_start_failures++;
+    (void)SD_RemountForLogger();
+    result = Logger_StartRecording();
+    logger_start_result = (uint32_t)result;
+    return result;
+}
+
+static FRESULT Logger_FinalizeRecording(void)
+{
+    if (!log_open) return FR_OK;
+
+    if (log_rows == 0U)
+    {
+        char path[32];
+        sd_sync_result = (uint32_t)Logger_SyncActiveFile();
+        sd_close_result = (uint32_t)f_close(&log_file);
+        log_open = 0U;
+        current_log_filename[0] = '\0';
+        MakePath(path, sizeof(path), ACTIVE_LOG_NAME);
+        return f_unlink(path);
+    }
+
+    return Logger_CloseAndQueue(0U);
+}
+
+static void Logger_Drain(uint32_t maximum_rows)
+{
+    if (!log_open) return;
+    if (sd_logger_write_fault && ((HAL_GetTick() - sd_write_retry_tick) < 100U))
+        return;
+    char line[96];
+    uint32_t drained = 0U;
+    while ((ring_tail != ring_head) && (drained < maximum_rows))
+    {
+        uint16_t tail = ring_tail;
+        SampleRecord sample = sample_ring[tail];
+
+        int length = snprintf(line, sizeof(line), "%lu,%d,%d,%d,%ld,%ld\r\n",
+                              (unsigned long)sample.tick_ms,
+                              sample.accel_x, sample.accel_y, sample.accel_z,
+                              (long)sample.ecg_ch1, (long)sample.ecg_ch2);
+        if ((length <= 0) || ((size_t)length >= sizeof(line)))
+        {
+            sd_write_errors++;
+            Error_Handler();
+        }
+        UINT written = 0U;
+        FRESULT result = f_write(&log_file, line, (UINT)length, &written);
+        if ((result != FR_OK) || (written != (UINT)length))
+        {
+            if (!sd_logger_write_fault) sd_write_errors++;
+            sd_logger_write_fault = 1U;
+            sd_last_write_result = (uint32_t)result;
+            sd_write_retry_tick = HAL_GetTick();
+            break;
+        }
+        sd_logger_write_fault = 0U;
+        sd_last_write_result = 0U;
+        ring_tail = (uint16_t)((tail + 1U) & SAMPLE_RING_MASK);
+        log_rows++;
+        total_samples_logged++;
+        drained++;
+    }
+}
+
+static void Logger_ScanQueue(void)
+{
+    DIR directory;
+    FILINFO info;
+    uint32_t maximum_sequence = 0U;
+    sd_files_queued = 0U;
+    if (f_opendir(&directory, SDPath) != FR_OK) return;
+    while ((f_readdir(&directory, &info) == FR_OK) && (info.fname[0] != '\0'))
+    {
+        unsigned long sequence = 0U;
+        if (IsReadyFileName(info.fname) &&
+            (sscanf(info.fname, "ECG%5lu.RDY", &sequence) == 1))
+        {
+            sd_files_queued++;
+            if (sequence > maximum_sequence) maximum_sequence = (uint32_t)sequence;
+        }
+    }
+    (void)f_closedir(&directory);
+    file_sequence = maximum_sequence + 1U;
+}
+
+static void Logger_RecoverQueue(void)
+{
+    Logger_ScanQueue();
+    char active_path[32];
+    MakePath(active_path, sizeof(active_path), ACTIVE_LOG_NAME);
+    FILINFO info;
+    if (f_stat(active_path, &info) == FR_OK)
+    {
+        if (info.fsize <= strlen(CSV_HEADER))
+        {
+            (void)f_unlink(active_path);
+        }
+        else
+        {
+            char ready_name[16], ready_path[32];
+            ReadyName(ready_name, sizeof(ready_name), file_sequence++);
+            MakePath(ready_path, sizeof(ready_path), ready_name);
+            if (f_rename(active_path, ready_path) == FR_OK)
             {
-                last_modem_response[idx++] = (char)ch;
-                last_modem_response[idx]   = '\0';
-                if (strstr((char*)last_modem_response, expected_response))
-                    return 1;
+                sd_files_queued++;
+            }
+            else
+            {
+                sd_write_errors++;
+                snprintf((char *)system_status, sizeof(system_status),
+                         "SD active recovery deferred");
             }
         }
     }
-    return 0;
 }
 
-/**
- * @brief Send a small buffer of raw bytes to the modem UART.
- *        Called repeatedly with UPLOAD_STRIP_SIZE-sized slices.
- */
-static void Modem_SendRaw(const uint8_t *data, uint16_t len)
+static uint8_t FindOldestReady(char *path, size_t path_size)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t*)data, len, 2000);
-}
-
-/* ===========================================================================
- *  UPLOAD LOGIC
- * ===========================================================================*/
-
-/**
- * @brief Upload one .RDY file to the server, streaming SD → UART directly.
- *
- *        RAM usage: one 512-byte strip buffer (one SD sector).
- *        No large intermediate buffer is allocated.
- *
- *        The file is split into logical POST chunks of up to UPLOAD_CHUNK_SIZE
- *        bytes. For each chunk:
- *          AT+HTTPINIT
- *          AT+HTTPPARA="CID",1
- *          AT+HTTPPARA="URL","<UPLOAD_URL>"
- *          AT+HTTPPARA="CONTENT","text/csv"
- *          AT+HTTPDATA=<chunk_bytes>,30000  -> wait for "DOWNLOAD" prompt
- *          <stream chunk_bytes from SD in UPLOAD_STRIP_SIZE strips>
- *          AT+HTTPACTION=1                  -> POST, wait for +HTTPACTION:
- *          AT+HTTPTERM
- *
- * @param  filename  FatFS path to the .RDY file.
- * @return 1 on complete success, 0 on any failure.
- */
-static uint8_t Upload_File(const char *filename)
-{
-    FIL     fil;
-    FRESULT fres;
-    UINT    bytes_read;
-
-    /* Single-sector strip buffer — only 512 bytes in RAM */
-    static uint8_t strip[UPLOAD_STRIP_SIZE];
-
-    fres = f_open(&fil, filename, FA_READ);
-    if (fres != FR_OK)
+    DIR directory;
+    FILINFO info;
+    char selected[32] = {0};
+    if (f_opendir(&directory, SDPath) != FR_OK) return 0U;
+    while (f_readdir(&directory, &info) == FR_OK && info.fname[0] != '\0')
     {
-        snprintf((char*)test_status, sizeof(test_status),
-                 "Upload: f_open failed (%d)", fres);
-        return 0;
+        if ((info.fattrib & AM_DIR) != 0U) continue;
+        if (!IsReadyFileName(info.fname)) continue;
+        if ((selected[0] == '\0') || (strcmp(info.fname, selected) < 0))
+        {
+            strncpy(selected, info.fname, sizeof(selected) - 1U);
+            selected[sizeof(selected) - 1U] = '\0';
+        }
+    }
+    (void)f_closedir(&directory);
+    if (selected[0] == '\0') return 0U;
+    MakePath(path, path_size, selected);
+    return 1U;
+}
+
+static void Modem_StopRx(void)
+{
+    modem_rx_active = 0U;
+    (void)HAL_UART_AbortReceive(&huart1);
+}
+
+static HAL_StatusTypeDef Modem_StartRx(void)
+{
+    Modem_StopRx();
+    uint8_t byte;
+    while (HAL_UART_Receive(&huart1, &byte, 1U, 1U) == HAL_OK) {}
+    memset((char *)modem_rx, 0, sizeof(modem_rx));
+    modem_rx_len = 0U;
+    uart_error_flags = 0U;
+    modem_rx_active = 1U;
+    HAL_StatusTypeDef status = HAL_UART_Receive_IT(&huart1,
+                                                   (uint8_t *)&modem_rx_byte, 1U);
+    if (status != HAL_OK) modem_rx_active = 0U;
+    return status;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart->Instance != USART1) || !modem_rx_active) return;
+    if (modem_rx_len < (sizeof(modem_rx) - 1U))
+    {
+        modem_rx[modem_rx_len++] = (char)modem_rx_byte;
+        modem_rx[modem_rx_len] = '\0';
+    }
+    if (HAL_UART_Receive_IT(&huart1, (uint8_t *)&modem_rx_byte, 1U) != HAL_OK)
+        modem_rx_active = 0U;
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART1) return;
+    uint32_t error = HAL_UART_GetError(huart);
+    uart_error_flags |= error;
+    if ((error & HAL_UART_ERROR_ORE) != 0U) uart_overruns++;
+    __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_OREF | UART_CLEAR_NEF |
+                                UART_CLEAR_FEF | UART_CLEAR_PEF);
+    if (modem_rx_active)
+        (void)HAL_UART_Receive_IT(huart, (uint8_t *)&modem_rx_byte, 1U);
+}
+
+static uint8_t Modem_Wait(const char *token, uint32_t timeout_ms,
+                          uint8_t require_complete_line)
+{
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        const char *found = strstr((const char *)modem_rx, token);
+        if (found != NULL)
+        {
+            if (!require_complete_line || (strchr(found, '\n') != NULL)) return 1U;
+        }
+        if (strstr((const char *)modem_rx, "ERROR") != NULL) return 0U;
+        Background_Service();
+        HAL_Delay(1U);
+    }
+    return 0U;
+}
+
+static uint8_t Modem_Command(const char *command, const char *expected,
+                             uint32_t timeout_ms, uint8_t complete_line)
+{
+    if (Modem_StartRx() != HAL_OK) return 0U;
+    if (HAL_UART_Transmit(&huart1, (uint8_t *)command,
+                          (uint16_t)strlen(command), 2000U) != HAL_OK)
+    {
+        Modem_StopRx();
+        return 0U;
+    }
+    uint8_t result = Modem_Wait(expected, timeout_ms, complete_line);
+    Modem_StopRx();
+    snprintf((char *)last_modem_response, sizeof(last_modem_response), "%s",
+             (const char *)modem_rx);
+    return result;
+}
+
+static void Modem_ServiceDelay(uint32_t delay_ms)
+{
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < delay_ms)
+    {
+        Background_Service();
+        HAL_Delay(1U);
+    }
+}
+
+static void Modem_RecordBootFailure(const char *step)
+{
+    modem_boot_stage = 255U;
+    snprintf((char *)modem_boot_failure, sizeof(modem_boot_failure), "%s", step);
+    snprintf((char *)modem_boot_last_response,
+             sizeof(modem_boot_last_response), "%s",
+             (const char *)last_modem_response);
+    snprintf((char *)system_status, sizeof(system_status),
+             "Modem failed: %s", step);
+}
+
+static uint8_t Modem_TryAT(uint8_t attempts)
+{
+    for (uint8_t i = 0U; i < attempts; i++)
+    {
+        if (Modem_Command("AT\r\n", "OK", 1500U, 0U)) return 1U;
+        Modem_ServiceDelay(500U);
+    }
+    return 0U;
+}
+
+static uint8_t Modem_IsRegistered(void)
+{
+    const char *response = (const char *)last_modem_response;
+    return (strstr(response, ": 1,1") != NULL) ||
+           (strstr(response, ": 1,5") != NULL) ||
+           (strstr(response, ":1,1")  != NULL) ||
+           (strstr(response, ":1,5")  != NULL);
+}
+
+static uint8_t Modem_Boot(void)
+{
+    modem_boot_failure[0] = '\0';
+    modem_boot_last_response[0] = '\0';
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1 | GPIO_PIN_2, GPIO_PIN_RESET);
+    Modem_ServiceDelay(200U);
+
+    /* Never toggle PWRKEY blindly. A debugger reset often leaves the modem on. */
+    modem_boot_stage = 1U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "Modem: probing existing power");
+    uint8_t responsive = Modem_TryAT(3U);
+
+    if (!responsive)
+    {
+        modem_boot_stage = 2U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Modem: PWRKEY power-on");
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+        Modem_ServiceDelay(600U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+        Modem_ServiceDelay(8000U);
+        responsive = Modem_TryAT(10U);
     }
 
-    FSIZE_t  file_size      = f_size(&fil);
-    FSIZE_t  file_pos       = 0;
-    uint32_t chunk_num      = 0;
-    char     httpdata_cmd[64];
-
-    while (file_pos < file_size)
+    if (!responsive)
     {
-        chunk_num++;
+        modem_boot_stage = 3U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Modem: hardware reset recovery");
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+        Modem_ServiceDelay(500U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+        Modem_ServiceDelay(8000U);
+        responsive = Modem_TryAT(10U);
+    }
 
-        /* How many bytes does this POST chunk cover? */
-        uint32_t chunk_bytes = (uint32_t)(file_size - file_pos);
-        if (chunk_bytes > UPLOAD_CHUNK_SIZE)
-            chunk_bytes = (uint32_t)UPLOAD_CHUNK_SIZE;
+    if (!responsive)
+    {
+        modem_boot_stage = 4U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Modem: forced off/on recovery");
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+        Modem_ServiceDelay(2500U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+        Modem_ServiceDelay(3000U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+        Modem_ServiceDelay(600U);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+        Modem_ServiceDelay(8000U);
+        responsive = Modem_TryAT(10U);
+    }
 
-        snprintf((char*)test_status, sizeof(test_status),
-                 "Upload: chunk %lu (%lu B, pos %lu)...",
-                 chunk_num, chunk_bytes, (uint32_t)file_pos);
+    if (!responsive)
+    {
+        Modem_RecordBootFailure("NO_AT_RESPONSE");
+        return 0U;
+    }
 
-        /* ---- HTTP session setup ---- */
-        if (!Send_AT_Command("AT+HTTPINIT\r\n", "OK", 5000))
+    modem_boot_stage = 10U;
+    snprintf((char *)system_status, sizeof(system_status), "Modem: SIM check");
+    (void)Modem_Command("ATE0\r\n", "OK", 2000U, 0U);
+    if (!Modem_Command("AT+CPIN?\r\n", "READY", 5000U, 0U))
+    {
+        Modem_RecordBootFailure("SIM_NOT_READY");
+        return 0U;
+    }
+    (void)Modem_Command("AT+CEREG=1\r\n", "OK", 2000U, 0U);
+
+    modem_boot_stage = 20U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "Modem: LTE registration");
+    uint32_t registration_start = HAL_GetTick();
+    while ((HAL_GetTick() - registration_start) < 90000U)
+    {
+        if (Modem_Command("AT+CEREG?\r\n", "OK", 3000U, 0U))
         {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: HTTPINIT failed (chunk %lu)", chunk_num);
-            f_close(&fil);
-            return 0;
+            if (Modem_IsRegistered()) break;
         }
-        if (!Send_AT_Command("AT+HTTPPARA=\"CID\",1\r\n", "OK", 3000))
-        {
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
-        }
-        if (!Send_AT_Command("AT+HTTPPARA=\"URL\",\"" UPLOAD_URL "\"\r\n", "OK", 3000))
-        {
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
-        }
-        if (!Send_AT_Command("AT+HTTPPARA=\"CONTENT\",\"text/csv\"\r\n", "OK", 3000))
-        {
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
-        }
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Modem: LTE registration %lus",
+                 (unsigned long)((HAL_GetTick() - registration_start) / 1000U));
+        Modem_ServiceDelay(2000U);
+    }
+    if ((HAL_GetTick() - registration_start) >= 90000U)
+    {
+        Modem_RecordBootFailure("LTE_REGISTRATION_TIMEOUT");
+        return 0U;
+    }
 
-        /* AT+HTTPDATA tells the modem exactly how many bytes are coming.
-         * 30 000 ms gives plenty of time to stream from slow SD cards.  */
-        snprintf(httpdata_cmd, sizeof(httpdata_cmd),
-                 "AT+HTTPDATA=%lu,30000\r\n", chunk_bytes);
+    modem_boot_stage = 30U;
+    snprintf((char *)system_status, sizeof(system_status), "Modem: PDP setup");
+    char command[96];
+    snprintf(command, sizeof(command),
+             "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", MODEM_APN);
+    (void)Modem_Command(command, "OK", 5000U, 0U);
+    (void)Modem_Command("AT+CGATT=1\r\n", "OK", 15000U, 0U);
+    (void)Modem_Command("AT+CGACT=1,1\r\n", "OK", 15000U, 0U);
 
-        if (!Send_AT_Command(httpdata_cmd, "DOWNLOAD", 10000))
+    modem_boot_stage = 40U;
+    snprintf((char *)system_status, sizeof(system_status), "Modem: checking IP");
+    uint32_t ip_start = HAL_GetTick();
+    uint8_t has_ip = 0U;
+    while ((HAL_GetTick() - ip_start) < 30000U)
+    {
+        if (Modem_Command("AT+CGPADDR=1\r\n", "+CGPADDR:", 5000U, 0U) &&
+            (strstr((const char *)last_modem_response, "0.0.0.0") == NULL) &&
+            (strstr((const char *)last_modem_response, ".") != NULL))
         {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: HTTPDATA prompt timeout (chunk %lu)", chunk_num);
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
+            has_ip = 1U;
+            break;
         }
+        Modem_ServiceDelay(2000U);
+    }
+    if (!has_ip)
+    {
+        Modem_RecordBootFailure("NO_PDP_IP_ADDRESS");
+        return 0U;
+    }
 
-        /* ---- Stream chunk_bytes from SD → UART in 512-byte strips ---- */
-        uint32_t streamed = 0;
-        while (streamed < chunk_bytes)
+    modem_boot_stage = 100U;
+    snprintf((char *)modem_boot_last_response,
+             sizeof(modem_boot_last_response), "%s",
+             (const char *)last_modem_response);
+    snprintf((char *)system_status, sizeof(system_status),
+             "Modem: PDP context ready");
+    return 1U;
+}
+
+static void Upload_CaptureFailure(const char *step)
+{
+    snprintf((char *)upload_failure_step, sizeof(upload_failure_step), "%s", step);
+    const char *source = (modem_rx_len > 0U)
+                       ? (const char *)modem_rx
+                       : (const char *)last_modem_response;
+    snprintf((char *)upload_failure_response,
+             sizeof(upload_failure_response), "%s", source);
+}
+
+static void QuarantineReadyFile(const char *path)
+{
+    char bad_path[32];
+    snprintf(bad_path, sizeof(bad_path), "%s", path);
+    char *ext = strstr(bad_path, ".RDY");
+    if (ext != NULL)
+    {
+        snprintf(ext, 5U, ".BAD");
+        sd_rename_result = (uint32_t)f_rename(path, bad_path);
+        if (sd_rename_result == (uint32_t)FR_OK)
         {
-            uint32_t want = chunk_bytes - streamed;
-            if (want > UPLOAD_STRIP_SIZE) want = UPLOAD_STRIP_SIZE;
+            if (sd_files_queued > 0U) sd_files_queued--;
+            snprintf((char *)system_status, sizeof(system_status),
+                     "Quarantined oversized batch %s", bad_path);
+            return;
+        }
+    }
 
-            fres = f_read(&fil, strip, (UINT)want, &bytes_read);
-            if (fres != FR_OK || bytes_read == 0)
+    sd_unlink_result = (uint32_t)f_unlink(path);
+    if (sd_unlink_result == (uint32_t)FR_OK)
+    {
+        if (sd_files_queued > 0U) sd_files_queued--;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Deleted oversized batch %s", path);
+    }
+    else upload_delete_failures++;
+}
+
+static uint8_t HTTP_PostFile(const char *path)
+{
+    FIL upload;
+    FILINFO info;
+    uint8_t upload_open = 0U;
+    if (f_stat(path, &info) != FR_OK)
+    {
+        Upload_CaptureFailure("FILE_STAT");
+        return 0U;
+    }
+    uint32_t file_size = (uint32_t)info.fsize;
+    char command[200];
+    uint8_t success = 0U;
+    current_http_status = 0U;
+    upload_bytes_sent = 0U;
+    upload_stage = 10U;
+    upload_failure_step[0] = '\0';
+    upload_failure_response[0] = '\0';
+
+    (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
+    if (!Modem_Command("AT+HTTPINIT\r\n", "OK", 5000U, 0U))
+    {
+        Upload_CaptureFailure("HTTPINIT");
+        goto done;
+    }
+    snprintf(command, sizeof(command), "AT+HTTPPARA=\"URL\",\"%s\"\r\n", UPLOAD_URL);
+    if (!Modem_Command(command, "OK", 5000U, 0U))
+    {
+        Upload_CaptureFailure("URL");
+        goto terminate;
+    }
+    if (!Modem_Command("AT+HTTPPARA=\"CONTENT\",\"text/csv\"\r\n",
+                       "OK", 3000U, 0U))
+    {
+        Upload_CaptureFailure("CONTENT");
+        goto terminate;
+    }
+    snprintf(command, sizeof(command), "AT+HTTPDATA=%lu,60000\r\n",
+             (unsigned long)file_size);
+    if (!Modem_Command(command, "DOWNLOAD", 5000U, 0U))
+    {
+        Upload_CaptureFailure("HTTPDATA_PROMPT");
+        goto terminate;
+    }
+    upload_stage = 20U;
+
+    /* Keep the upload file open only while its bytes are being read. During
+     * this short phase Background_Service continues sampling but does not
+     * write the active log, preventing alternating SD reads and writes. */
+    sd_upload_read_active = 1U;
+    if (f_open(&upload, path, FA_READ) != FR_OK)
+    {
+        Upload_CaptureFailure("FILE_OPEN");
+        sd_upload_read_active = 0U;
+        goto terminate;
+    }
+    upload_open = 1U;
+
+    if (Modem_StartRx() != HAL_OK)
+    {
+        Upload_CaptureFailure("DATA_RX_ARM");
+        goto terminate;
+    }
+    upload_stage = 30U;
+    uint8_t chunk[512];
+    UINT bytes_read = 0U;
+    do
+    {
+        if (f_read(&upload, chunk, sizeof(chunk), &bytes_read) != FR_OK)
+        {
+            Upload_CaptureFailure("FILE_READ");
+            Modem_StopRx();
+            goto terminate;
+        }
+        if ((bytes_read > 0U) &&
+            (HAL_UART_Transmit(&huart1, chunk, (uint16_t)bytes_read, 3000U) != HAL_OK))
+        {
+            Upload_CaptureFailure("DATA_TX");
+            Modem_StopRx();
+            goto terminate;
+        }
+        upload_bytes_sent += bytes_read;
+        Background_Service();
+    } while (bytes_read > 0U);
+
+    sd_close_result = (uint32_t)f_close(&upload);
+    upload_open = 0U;
+    sd_upload_read_active = 0U;
+    if (sd_close_result != (uint32_t)FR_OK)
+    {
+        Upload_CaptureFailure("FILE_CLOSE");
+        Modem_StopRx();
+        goto terminate;
+    }
+    upload_stage = 40U;
+    Background_Service();
+
+    if (!Modem_Wait("OK", 65000U, 0U))
+    {
+        Upload_CaptureFailure("DATA_ACK");
+        Modem_StopRx();
+        goto terminate;
+    }
+    upload_stage = 50U;
+    Modem_StopRx();
+
+    if (!Modem_Command("AT+HTTPACTION=1\r\n", "+HTTPACTION:",
+                       65000U, 1U))
+    {
+        Upload_CaptureFailure("HTTPACTION_WAIT");
+        goto terminate;
+    }
+    {
+        const char *action = strstr((const char *)last_modem_response, "+HTTPACTION:");
+        unsigned long status = 0U, response_length = 0U;
+        if ((action != NULL) &&
+            (sscanf(action, "+HTTPACTION: %*u,%lu,%lu",
+                    &status, &response_length) == 2))
+        {
+            current_http_status = (uint32_t)status;
+            last_http_status = current_http_status;
+            success = (status == 200U) ? 1U : 0U;
+            if (success) upload_stage = 70U;
+            else Upload_CaptureFailure("HTTP_STATUS");
+        }
+        else Upload_CaptureFailure("HTTPACTION_PARSE");
+    }
+
+terminate:
+    upload_stage = success ? 80U : upload_stage;
+    (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
+done:
+    if (upload_open) (void)f_close(&upload);
+    sd_upload_read_active = 0U;
+    if (!success) upload_stage = 255U;
+    return success;
+}
+
+static void Upload_OldestReady(void)
+{
+    char path[32];
+    if (!FindOldestReady(path, sizeof(path)))
+    {
+        queue_reconcile_events++;
+        Upload_CaptureFailure("NO_READY_FILE");
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Upload queue mismatch: rescanning");
+        Logger_ScanQueue();
+        return;
+    }
+    FILINFO info;
+    if (f_stat(path, &info) != FR_OK)
+    {
+        queue_reconcile_events++;
+        snprintf((char *)current_upload_filename, sizeof(current_upload_filename), "%s", path);
+        Upload_CaptureFailure("READY_STAT");
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Ready file stat failed: %s", path);
+        current_upload_filename[0] = '\0';
+        Logger_ScanQueue();
+        return;
+    }
+    last_upload_file_size = (uint32_t)info.fsize;
+    if (info.fsize <= strlen(CSV_HEADER))
+    {
+        if (f_unlink(path) == FR_OK && sd_files_queued > 0U) sd_files_queued--;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Discarded empty batch %s", path);
+        return;
+    }
+    if (info.fsize > MAX_HTTPDATA_BYTES)
+    {
+        upload_oversize_files++;
+        snprintf((char *)current_upload_filename, sizeof(current_upload_filename), "%s", path);
+        snprintf((char *)upload_failure_step, sizeof(upload_failure_step), "OVERSIZE");
+        snprintf((char *)upload_failure_response, sizeof(upload_failure_response),
+                 "File %lu exceeds modem HTTPDATA limit %lu",
+                 (unsigned long)info.fsize, (unsigned long)MAX_HTTPDATA_BYTES);
+        QuarantineReadyFile(path);
+        current_upload_filename[0] = '\0';
+        return;
+    }
+    snprintf((char *)current_upload_filename, sizeof(current_upload_filename), "%s", path);
+    upload_in_progress = 1U;
+    uint8_t uploaded = 0U;
+
+    for (uint32_t attempt = 1U; attempt <= HTTP_MAX_ATTEMPTS; attempt++)
+    {
+        last_upload_attempts = attempt;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Uploading %s attempt %lu", path, (unsigned long)attempt);
+        if (HTTP_PostFile(path))
+        {
+            upload_stage = 90U;
+            uploads_ok++;
+            sd_unlink_result = (uint32_t)f_unlink(path);
+            if (sd_unlink_result == (uint32_t)FR_OK)
             {
-                snprintf((char*)test_status, sizeof(test_status),
-                         "Upload: f_read err=%d (chunk %lu, strip %lu B)",
-                         fres, chunk_num, streamed);
-                Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-                f_close(&fil);
-                return 0;
+                if (sd_files_queued > 0U) sd_files_queued--;
             }
-            Modem_SendRaw(strip, (uint16_t)bytes_read);
-            streamed += bytes_read;
+            else upload_delete_failures++;
+            uploaded = 1U;
+            break;
         }
-
-        /* Modem signals it has received all declared bytes with "OK" */
-        if (!Send_AT_Command("", "OK", 10000))
+        if (attempt < HTTP_MAX_ATTEMPTS)
         {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: data ACK timeout (chunk %lu)", chunk_num);
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
+            uint32_t start = HAL_GetTick();
+            while ((HAL_GetTick() - start) < HTTP_RETRY_BACKOFF_MS)
+            {
+                Background_Service();
+                HAL_Delay(1U);
+            }
         }
+    }
+    if (!uploaded) uploads_failed++;
+    upload_in_progress = 0U;
+    current_upload_filename[0] = '\0';
 
-        /* POST — server has up to 35 s to respond */
-        if (!Send_AT_Command("AT+HTTPACTION=1\r\n", "+HTTPACTION:", 35000))
+    if (uploaded) upload_stage = 100U;
+}
+
+static void Background_Service(void)
+{
+    ADS_Service();
+    LIS3DH_Service();
+    if (!sd_upload_read_active) Logger_Drain(32U);
+}
+
+static void Run_RecordPhase(void)
+{
+    system_phase = 20U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "Recording session %lu", (unsigned long)(record_sessions_completed + 1U));
+
+    while (Logger_StartRecordingWithRecovery() != FR_OK)
+    {
+        system_phase = 60U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD log start retry: %lu",
+                 (unsigned long)logger_start_result);
+        uint32_t retry_start = HAL_GetTick();
+        while ((HAL_GetTick() - retry_start) < SD_RECORD_START_RETRY_MS)
         {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: POST timeout (chunk %lu)", chunk_num);
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
+            LIS3DH_Service();
+            HAL_Delay(10U);
         }
+    }
+    system_phase = 20U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "Recording session %lu", (unsigned long)(record_sessions_completed + 1U));
 
-        if (!strstr((char*)last_modem_response, ",200,"))
-        {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: non-200 (chunk %lu): %.60s",
-                     chunk_num, (char*)last_modem_response);
-            Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-            f_close(&fil);
-            return 0;
-        }
-
-        Send_AT_Command("AT+HTTPTERM\r\n", "OK", 3000);
-        file_pos += chunk_bytes;
-
-        snprintf((char*)test_status, sizeof(test_status),
-                 "Upload: chunk %lu OK (%lu/%lu B)",
-                 chunk_num, (uint32_t)file_pos, (uint32_t)file_size);
+    if (ADS_StartAcquisition() != HAL_OK)
+    {
+        system_phase = 255U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "ADS start failed: ID=%lu", (unsigned long)ads_id_value);
+        Error_Handler();
     }
 
-    f_close(&fil);
-    snprintf((char*)test_status, sizeof(test_status),
-             "Upload: DONE (%lu chunks)", chunk_num);
-    return 1;
+    uint32_t record_start = HAL_GetTick();
+    uint32_t session_start_logged = total_samples_logged;
+    uint32_t session_last_logged = total_samples_logged;
+    record_last_progress_tick = HAL_GetTick();
+    record_abort_reason[0] = '\0';
+    while (((total_samples_logged - session_start_logged) < SAMPLES_PER_FILE) &&
+           ((HAL_GetTick() - record_start) < RECORD_SESSION_MAX_MS))
+    {
+        ADS_Service();
+        LIS3DH_Service();
+        Logger_Drain(64U);
+        uint32_t session_logged_now = total_samples_logged;
+        if (session_logged_now != session_last_logged)
+        {
+            session_last_logged = session_logged_now;
+            record_last_progress_tick = HAL_GetTick();
+        }
+        else if ((HAL_GetTick() - record_last_progress_tick) >= RECORD_PROGRESS_TIMEOUT_MS)
+        {
+            record_progress_timeouts++;
+            snprintf((char *)record_abort_reason, sizeof(record_abort_reason),
+                     "Recording stalled");
+            snprintf((char *)system_status, sizeof(system_status),
+                     "Recording stalled; SD recovery");
+            ADS_StopAcquisition();
+            if (log_open)
+            {
+                (void)f_close(&log_file);
+                log_open = 0U;
+                current_log_filename[0] = '\0';
+            }
+            (void)SD_RemountForLogger();
+            system_phase = 60U;
+            return;
+        }
+    }
+
+    system_phase = 30U;
+    snprintf((char *)system_status, sizeof(system_status), "Finalizing recording");
+    ADS_StopAcquisition();
+
+    uint32_t drain_start = HAL_GetTick();
+    while (ring_tail != ring_head)
+    {
+        uint16_t before = ring_tail;
+        Logger_Drain(128U);
+        if ((ring_tail == before) && ((HAL_GetTick() - drain_start) >= 5000U))
+        {
+            sd_drain_failures++;
+            snprintf((char *)system_status, sizeof(system_status),
+                     "SD drain failed: %lu", (unsigned long)sd_last_write_result);
+            ring_tail = ring_head;
+            break;
+        }
+    }
+
+    if (Logger_FinalizeRecording() != FR_OK)
+    {
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD finalize deferred: %lu", (unsigned long)sd_last_write_result);
+        (void)f_close(&log_file);
+        log_open = 0U;
+        current_log_filename[0] = '\0';
+        Logger_RecoverQueue();
+    }
+    record_sessions_completed++;
 }
 
-/**
- * @brief Rename a FatFS file by copying then deleting the original.
- *        FatFS f_rename cannot move across drives but works fine here.
- */
-static void Rename_File(const char *old_name, const char *new_name)
+static void Run_UploadPhase(void)
 {
-    f_rename(old_name, new_name);
+    ADS_StopAcquisition();
+    if (log_open && (Logger_FinalizeRecording() != FR_OK))
+    {
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD finalize deferred: %lu", (unsigned long)sd_last_write_result);
+        (void)f_close(&log_file);
+        log_open = 0U;
+        current_log_filename[0] = '\0';
+    }
+
+    Logger_RecoverQueue();
+    system_phase = 40U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "Uploading %lu queued files", (unsigned long)sd_files_queued);
+
+    while (sd_files_queued > 0U)
+    {
+        uint32_t queued_before = sd_files_queued;
+        Upload_OldestReady();
+        if (sd_files_queued >= queued_before)
+        {
+            system_phase = 50U;
+            snprintf((char *)system_status, sizeof(system_status),
+                     "Upload deferred; %lu files queued",
+                     (unsigned long)sd_files_queued);
+            return;
+        }
+    }
+
+    upload_phases_completed++;
+    system_phase = 100U;
+    snprintf((char *)system_status, sizeof(system_status), "Upload queue drained");
 }
 
-/* USER CODE END PFP */
+static void Drain_UploadQueueBeforeNextRecord(void)
+{
+    for (;;)
+    {
+        Logger_RecoverQueue();
+        if (sd_files_queued == 0U)
+        {
+            return;
+        }
 
+        Run_UploadPhase();
+        Logger_RecoverQueue();
+        if (sd_files_queued == 0U)
+        {
+            return;
+        }
 
-/* ===========================================================================
- *  APPLICATION ENTRY POINT
- * ===========================================================================*/
+        system_phase = 50U;
+        snprintf((char *)system_status, sizeof(system_status),
+                 "Upload retry idle; %lu files queued",
+                 (unsigned long)sd_files_queued);
+
+        uint32_t start = HAL_GetTick();
+        while ((HAL_GetTick() - start) < UPLOAD_RETRY_IDLE_MS)
+        {
+            LIS3DH_Service();
+            HAL_Delay(10U);
+        }
+    }
+}
+
 int main(void)
 {
     HAL_Init();
     SystemClock_Config();
-
     MX_GPIO_Init();
     MX_I2C1_Init();
     MX_SDMMC1_SD_Init();
     MX_SPI1_Init();
     MX_USART1_UART_Init();
-    MX_RTC_Init();
     MX_FATFS_Init();
 
-    /* USER CODE BEGIN 2 */
+    system_phase = 10U;
+    snprintf((char *)system_status, sizeof(system_status), "Recovering SD queue");
+    if (f_mount(&SDFatFS, SDPath, 1U) != FR_OK) Error_Handler();
+    Logger_RecoverQueue();
+    if (LIS3DH_Init() != HAL_OK) Error_Handler();
 
-    /* Locals declared before any goto */
-    FATFS           fs;
-    FIL             fil;
-    FRESULT         fres;
-    char            base_name[32];
-    char            filename_rdy[48];   /* ECG_....RDY  */
-    char            filename_done[48];  /* ECG_....DONE */
-    char            filename_fail[48];  /* ECG_....FAIL */
-    char            csv_line[160];
-    RTC_TimeTypeDef sTime        = {0};
-    RTC_DateTypeDef sDate        = {0};
-    uint32_t        sample_count = 0;
-    uint8_t         file_is_open = 0;
+    snprintf((char *)system_status, sizeof(system_status), "Connecting modem");
+    if (!Modem_Boot()) Error_Handler();
 
-    /* LIS3DH */
-    uint8_t  accel_buf[6];
-    int16_t  raw_x, raw_y, raw_z;
-    uint8_t  reg_val;
+    Drain_UploadQueueBeforeNextRecord();
 
-    /* ADS1292R */
-    int32_t  ecg_ch1 = 0, ecg_ch2 = 0;
-
-    /* Mount filesystem once — stays mounted for the lifetime of the program */
-    snprintf((char*)test_status, sizeof(test_status), "FatFS: Mounting...");
-    fres = f_mount(&fs, "", 1);
-    if (fres != FR_OK)
-    {
-        snprintf((char*)test_status, sizeof(test_status),
-                 "FAIL: f_mount err=%d", fres);
-        goto fatal_error;
-    }
-
-    /* ======================================================================
-     *  MAIN OPERATIONAL LOOP  (log → upload → repeat)
-     * ====================================================================== */
     while (1)
     {
-        /* ------------------------------------------------------------------
-         *  PHASE 0 — Ensure modem is OFF before logging starts
-         * ------------------------------------------------------------------ */
-        Modem_PowerOff();
-
-        /* ------------------------------------------------------------------
-         *  PHASE 1 — Initialise sensors
-         * ------------------------------------------------------------------ */
-        snprintf((char*)test_status, sizeof(test_status), "Init: ADS1292R...");
-        if (ADS_Init() != HAL_OK)
-            goto fatal_error;   /* test_status already set by ADS_Init */
-
-        snprintf((char*)test_status, sizeof(test_status), "Init: LIS3DH...");
-        reg_val = 0x57; /* ODR=100 Hz, XYZ on */
-        HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x20,
-                          I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
-        reg_val = 0x88; /* BDU=1, +/-2 g, HR=1 */
-        HAL_I2C_Mem_Write(&hi2c1, 0x18 << 1, 0x23,
-                          I2C_MEMADD_SIZE_8BIT, &reg_val, 1, 10);
-        HAL_Delay(100);
-        snprintf((char*)test_status, sizeof(test_status), "Init: LIS3DH OK");
-
-        /* ------------------------------------------------------------------
-         *  PHASE 2 — Build timestamped filename
-         * ------------------------------------------------------------------ */
-        HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-        HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-
-        snprintf(base_name, sizeof(base_name),
-                 "ECG_%04d%02d%02d_%02d%02d%02d",
-                 2000 + sDate.Year, sDate.Month,   sDate.Date,
-                 sTime.Hours,       sTime.Minutes, sTime.Seconds);
-
-        /* Try base.RDY; if it exists, append _1, _2 ... _99 */
-        snprintf(filename_rdy,  sizeof(filename_rdy),  "%s.RDY",  base_name);
-        snprintf(filename_done, sizeof(filename_done), "%s.DONE", base_name);
-        snprintf(filename_fail, sizeof(filename_fail), "%s.FAIL", base_name);
-
-        if (f_stat(filename_rdy, NULL) == FR_OK)
-        {
-            uint8_t suffix = 1;
-            do {
-                snprintf(filename_rdy,  sizeof(filename_rdy),
-                         "%s_%d.RDY",  base_name, suffix);
-                snprintf(filename_done, sizeof(filename_done),
-                         "%s_%d.DONE", base_name, suffix);
-                snprintf(filename_fail, sizeof(filename_fail),
-                         "%s_%d.FAIL", base_name, suffix);
-                suffix++;
-            } while ((f_stat(filename_rdy, NULL) == FR_OK) && (suffix <= 99));
-
-            if (suffix > 99)
-            {
-                snprintf((char*)test_status, sizeof(test_status),
-                         "FAIL: No free filename slot");
-                goto fatal_error;
-            }
-        }
-
-        /* ------------------------------------------------------------------
-         *  PHASE 3 — Open CSV file and write header
-         * ------------------------------------------------------------------ */
-        snprintf((char*)test_status, sizeof(test_status),
-                 "FatFS: Creating %s", filename_rdy);
-        HAL_Delay(200);
-
-        fres = f_open(&fil, filename_rdy, FA_CREATE_NEW | FA_WRITE);
-        if (fres != FR_OK)
-        {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "FAIL: f_open err=%d", fres);
-            goto fatal_error;
-        }
-        file_is_open  = 1;
-        sample_count  = 0;
-
-        f_puts("timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n", &fil);
-
-        /* ------------------------------------------------------------------
-         *  PHASE 4 — Logging loop (runs for LOG_DURATION_MS)
-         * ------------------------------------------------------------------ */
-        uint32_t log_start = HAL_GetTick();
-        snprintf((char*)test_status, sizeof(test_status),
-                 "Logging: %s (3 min)", filename_rdy);
-
-        while ((HAL_GetTick() - log_start) < LOG_DURATION_MS)
-        {
-            /* ADS1292R: wait for DRDY then read frame */
-            if (ADS_ReadData(&ecg_ch1, &ecg_ch2) != HAL_OK)
-            {
-                /* DRDY timeout — skip sample, keep logging */
-                continue;
-            }
-
-            /* LIS3DH: 6-byte burst read starting at OUT_X_L (auto-increment) */
-            HAL_I2C_Mem_Read(&hi2c1, 0x18 << 1, 0x28 | 0x80,
-                             I2C_MEMADD_SIZE_8BIT, accel_buf, 6, 10);
-
-            raw_x = (int16_t)((accel_buf[1] << 8) | accel_buf[0]) >> 4;
-            raw_y = (int16_t)((accel_buf[3] << 8) | accel_buf[2]) >> 4;
-            raw_z = (int16_t)((accel_buf[5] << 8) | accel_buf[4]) >> 4;
-
-            HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-            HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-
-            snprintf(csv_line, sizeof(csv_line),
-                     "%02d:%02d:%02d,%d,%d,%d,%ld,%ld\r\n",
-                     sTime.Hours, sTime.Minutes, sTime.Seconds,
-                     raw_x, raw_y, raw_z,
-                     ecg_ch1, ecg_ch2);
-            f_puts(csv_line, &fil);
-            sample_count++;
-
-            /* Flush every 500 samples (~1 s at 500 SPS) */
-            if (sample_count % 500 == 0)
-            {
-                f_sync(&fil);
-                snprintf((char*)test_status, sizeof(test_status),
-                         "Logging: %lu samples", sample_count);
-            }
-        }
-
-        /* ------------------------------------------------------------------
-         *  PHASE 5 — Close file (logging complete)
-         * ------------------------------------------------------------------ */
-        f_sync(&fil);
-        f_close(&fil);
-        file_is_open = 0;
-
-        snprintf((char*)test_status, sizeof(test_status),
-                 "Log done: %lu samples -> %s", sample_count, filename_rdy);
-        HAL_Delay(500);
-
-        /* ------------------------------------------------------------------
-         *  PHASE 6 — Boot modem
-         * ------------------------------------------------------------------ */
-        if (!Modem_PowerOn())
-        {
-            /* Modem failed to come online — flag file and continue */
-            snprintf((char*)test_status, sizeof(test_status),
-                     "FAIL: Modem offline, flagging %s", filename_rdy);
-            Rename_File(filename_rdy, filename_fail);
-            continue; /* Back to top of main loop */
-        }
-
-        /* Check signal quality before attempting upload */
-        if (!Send_AT_Command("AT+CSQ\r\n", "OK", 2000))
-        {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "FAIL: No signal, flagging %s", filename_rdy);
-            Modem_PowerOff();
-            Rename_File(filename_rdy, filename_fail);
-            continue;
-        }
-
-        /* ------------------------------------------------------------------
-         *  PHASE 7 — Upload with retries
-         * ------------------------------------------------------------------ */
-        uint8_t upload_ok = 0;
-
-        for (uint8_t attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++)
-        {
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: attempt %d/%d for %s",
-                     attempt, UPLOAD_MAX_RETRIES, filename_rdy);
-
-            if (Upload_File(filename_rdy))
-            {
-                upload_ok = 1;
-                break;
-            }
-
-            /* Upload failed — show status and wait before retry */
-            snprintf((char*)test_status, sizeof(test_status),
-                     "Upload: attempt %d FAILED, retrying...", attempt);
-            HAL_Delay(3000);
-        }
-
-        /* ------------------------------------------------------------------
-         *  PHASE 8 — Mark file and power down modem
-         * ------------------------------------------------------------------ */
-        Modem_PowerOff();
-
-        if (upload_ok)
-        {
-            Rename_File(filename_rdy, filename_done);
-            snprintf((char*)test_status, sizeof(test_status),
-                     "DONE: %s uploaded OK", filename_done);
-        }
-        else
-        {
-            Rename_File(filename_rdy, filename_fail);
-            snprintf((char*)test_status, sizeof(test_status),
-                     "FAIL: %s — all retries exhausted", filename_fail);
-        }
-
-        HAL_Delay(1000);
-        /* Loop back → new logging session */
+        Drain_UploadQueueBeforeNextRecord();
+        Run_RecordPhase();
+        Run_UploadPhase();
     }
-
-    /* ======================================================================
-     *  FATAL ERROR — only reached on unrecoverable init failures
-     * ====================================================================== */
-    fatal_error:
-        if (file_is_open) { f_close(&fil); }
-        f_mount(NULL, "", 0);
-        /* USER CODE END 2 */
-        while (1) { HAL_Delay(100); }
 }
-
-
-/* ===========================================================================
- *  PERIPHERAL INITIALISERS
- * ===========================================================================*/
 
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
     if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
         Error_Handler();
-
-    HAL_PWR_EnableBkUpAccess();
-    __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
-
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_LSI
-                                          | RCC_OSCILLATORTYPE_LSE
-                                          | RCC_OSCILLATORTYPE_MSI;
-    RCC_OscInitStruct.LSEState            = RCC_LSE_ON;
-    RCC_OscInitStruct.LSIState            = RCC_LSI_ON;
-    RCC_OscInitStruct.MSIState            = RCC_MSI_ON;
-    RCC_OscInitStruct.MSICalibrationValue = 0;
-    RCC_OscInitStruct.MSIClockRange       = RCC_MSIRANGE_6;
-    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_MSI;
-    RCC_OscInitStruct.PLL.PLLM            = 1;
-    RCC_OscInitStruct.PLL.PLLN            = 40;
-    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV7;
-    RCC_OscInitStruct.PLL.PLLQ            = RCC_PLLQ_DIV2;
-    RCC_OscInitStruct.PLL.PLLR            = RCC_PLLR_DIV2;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-        Error_Handler();
-
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK  | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-        Error_Handler();
-
-    HAL_RCCEx_EnableMSIPLLMode();
+    osc.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+    osc.MSIState = RCC_MSI_ON;
+    osc.MSICalibrationValue = 0;
+    osc.MSIClockRange = RCC_MSIRANGE_6;
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+    osc.PLL.PLLM = 1;
+    osc.PLL.PLLN = 40;
+    osc.PLL.PLLP = RCC_PLLP_DIV7;
+    osc.PLL.PLLQ = RCC_PLLQ_DIV2;
+    osc.PLL.PLLR = RCC_PLLR_DIV2;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV2;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
 }
 
 static void MX_I2C1_Init(void)
 {
-    hi2c1.Instance              = I2C1;
-    hi2c1.Init.Timing           = 0x00D09BE3;
-    hi2c1.Init.OwnAddress1      = 0;
-    hi2c1.Init.AddressingMode   = I2C_ADDRESSINGMODE_7BIT;
-    hi2c1.Init.DualAddressMode  = I2C_DUALADDRESS_DISABLE;
-    hi2c1.Init.OwnAddress2      = 0;
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.Timing = 0x00D09BE3;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
     hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-    hi2c1.Init.GeneralCallMode  = I2C_GENERALCALL_DISABLE;
-    hi2c1.Init.NoStretchMode    = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c1)                                          != HAL_OK) Error_Handler();
-    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) Error_Handler();
-    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0)                      != HAL_OK) Error_Handler();
-}
-
-static void MX_RTC_Init(void)
-{
-    RTC_TimeTypeDef sTime = {0};
-    RTC_DateTypeDef sDate = {0};
-
-    hrtc.Instance            = RTC;
-    hrtc.Init.HourFormat     = RTC_HOURFORMAT_24;
-    hrtc.Init.AsynchPrediv   = 127;
-    hrtc.Init.SynchPrediv    = 255;
-    hrtc.Init.OutPut         = RTC_OUTPUT_DISABLE;
-    hrtc.Init.OutPutRemap    = RTC_OUTPUT_REMAP_NONE;
-    hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
-    hrtc.Init.OutPutType     = RTC_OUTPUT_TYPE_OPENDRAIN;
-    if (HAL_RTC_Init(&hrtc) != HAL_OK)
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
+    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
         Error_Handler();
-
-    sTime.Hours          = 0x00;
-    sTime.Minutes        = 0x00;
-    sTime.Seconds        = 0x00;
-    sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
-    sTime.StoreOperation = RTC_STOREOPERATION_RESET;
-    if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
-        Error_Handler();
-
-    sDate.WeekDay = RTC_WEEKDAY_MONDAY;
-    sDate.Month   = RTC_MONTH_JANUARY;
-    sDate.Date    = 0x01;
-    sDate.Year    = 0x00;
-    if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
-        Error_Handler();
-
-    /* First-boot guard: only set the clock once after flashing.
-     * Clear RTC_BKP_DR0 via debugger to re-set the time.         */
-    if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) != 0xBEEF)
-    {
-        sTime.Hours          = 0x16;
-        sTime.Minutes        = 0x13;
-        sTime.Seconds        = 0x00;
-        sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
-        sTime.StoreOperation = RTC_STOREOPERATION_RESET;
-        HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD);
-
-        sDate.WeekDay = RTC_WEEKDAY_FRIDAY;
-        sDate.Month   = RTC_MONTH_MAY;
-        sDate.Date    = 0x29;
-        sDate.Year    = 0x26;
-        HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD);
-
-        HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, 0xBEEF);
-    }
 }
 
 static void MX_SDMMC1_SD_Init(void)
 {
-    hsd1.Instance                 = SDMMC1;
-    hsd1.Init.ClockEdge           = SDMMC_CLOCK_EDGE_RISING;
-    hsd1.Init.ClockBypass         = SDMMC_CLOCK_BYPASS_DISABLE;
-    hsd1.Init.ClockPowerSave      = SDMMC_CLOCK_POWER_SAVE_DISABLE;
-    hsd1.Init.BusWide             = SDMMC_BUS_WIDE_4B;
+    hsd1.Instance = SDMMC1;
+    hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+    hsd1.Init.ClockBypass = SDMMC_CLOCK_BYPASS_DISABLE;
+    hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+    hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
     hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-    hsd1.Init.ClockDiv            = 7;
-    if (HAL_SD_Init(&hsd1) != HAL_OK)
-        Error_Handler();
+    hsd1.Init.ClockDiv = 7;
+    if (HAL_SD_Init(&hsd1) != HAL_OK) Error_Handler();
     if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B) != HAL_OK)
         Error_Handler();
 }
 
 static void MX_SPI1_Init(void)
 {
-    /* ADS1292R: SPI Mode 1 (CPOL=0, CPHA=1), ~312 kHz at 80 MHz */
-    hspi1.Instance               = SPI1;
-    hspi1.Init.Mode              = SPI_MODE_MASTER;
-    hspi1.Init.Direction         = SPI_DIRECTION_2LINES;
-    hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
-    hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
-    hspi1.Init.CLKPhase          = SPI_PHASE_2EDGE;
-    hspi1.Init.NSS               = SPI_NSS_SOFT;
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
     hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
-    hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
-    hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
-    hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
-    hspi1.Init.CRCPolynomial     = 7;
-    hspi1.Init.CRCLength         = SPI_CRC_LENGTH_DATASIZE;
-    hspi1.Init.NSSPMode          = SPI_NSS_PULSE_ENABLE;
-    if (HAL_SPI_Init(&hspi1) != HAL_OK)
-        Error_Handler();
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 7;
+    hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+    hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
 }
 
 static void MX_USART1_UART_Init(void)
 {
-    huart1.Instance                    = USART1;
-    huart1.Init.BaudRate               = 115200;
-    huart1.Init.WordLength             = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits               = UART_STOPBITS_1;
-    huart1.Init.Parity                 = UART_PARITY_NONE;
-    huart1.Init.Mode                   = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl              = UART_HWCONTROL_NONE;
-    huart1.Init.OverSampling           = UART_OVERSAMPLING_16;
-    huart1.Init.OneBitSampling         = UART_ONE_BIT_SAMPLE_DISABLE;
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
     huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-    if (HAL_UART_Init(&huart1) != HAL_OK)
-        Error_Handler();
+    if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
 }
 
 static void MX_GPIO_Init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef gpio = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
 
-    /* Set safe idle levels before configuring directions */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13 | GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4,                GPIO_PIN_SET);   /* ADS CS idle HIGH */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4 | GPIO_PIN_13, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_8, GPIO_PIN_RESET);
 
-    /* PC13 (LED), PC4 (ADS RESET) */
-    GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_4;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    gpio.Pin = GPIO_PIN_4;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &gpio);
 
-    /* PA0 - general input */
-    GPIO_InitStruct.Pin  = GPIO_PIN_0;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    gpio.Pin = GPIO_PIN_4 | GPIO_PIN_13;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &gpio);
 
-    /* PA4 - ADS1292R chip-select */
-    GPIO_InitStruct.Pin   = GPIO_PIN_4;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    gpio.Pin = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_8;
+    HAL_GPIO_Init(GPIOB, &gpio);
 
-    /* PB1 (modem RESET NPN), PB2 (modem PWRKEY NPN), PB8 (spare output) */
-    GPIO_InitStruct.Pin   = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_8;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    /* PB5 (spare), PB9 (ADS1292R DRDY active-LOW, polled) */
-    GPIO_InitStruct.Pin  = GPIO_PIN_5 | GPIO_PIN_9;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    gpio.Pin = GPIO_PIN_9;
+    gpio.Mode = GPIO_MODE_IT_FALLING;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &gpio);
 }
-
-/* USER CODE BEGIN 4 */
-/* USER CODE END 4 */
 
 void Error_Handler(void)
 {
+    acquisition_enabled = 0U;
     __disable_irq();
-    while (1) { }
+    while (1) {}
 }
 
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    (void)file; (void)line;
+    (void)file;
+    (void)line;
 }
 #endif

@@ -26,12 +26,20 @@ extern SD_HandleTypeDef hsd1;
 #endif
 
 #define SD_DEFAULT_BLOCK_SIZE 512
+#define SD_TRANSFER_WAIT_TIMEOUT 5000U
 
 /* Private variables ---------------------------------------------------------*/
 static volatile DSTATUS Stat = STA_NOINIT;
 
+/* Live Expressions: physical SD recovery diagnostics. */
+volatile uint32_t sd_driver_timeouts = 0U;
+volatile uint32_t sd_driver_recoveries = 0U;
+volatile uint32_t sd_driver_recovery_failures = 0U;
+
 /* Private function prototypes -----------------------------------------------*/
 static DSTATUS SD_CheckStatus(BYTE lun);
+static uint8_t SD_WaitForTransfer(void);
+static uint8_t SD_RecoverCard(void);
 DSTATUS SD_initialize(BYTE);
 DSTATUS SD_status(BYTE);
 DRESULT SD_read(BYTE, BYTE*, DWORD, UINT);
@@ -67,6 +75,41 @@ static DSTATUS SD_CheckStatus(BYTE lun)
   return Stat;
 }
 
+static uint8_t SD_WaitForTransfer(void)
+{
+  uint32_t start = HAL_GetTick();
+  while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+  {
+    if ((HAL_GetTick() - start) >= SD_TRANSFER_WAIT_TIMEOUT)
+    {
+      sd_driver_timeouts++;
+      if (SD_RecoverCard()) sd_driver_recoveries++;
+      else sd_driver_recovery_failures++;
+      return 0U;
+    }
+  }
+  return 1U;
+}
+
+static uint8_t SD_RecoverCard(void)
+{
+  (void)HAL_SD_Abort(&hsd1);
+  (void)HAL_SD_DeInit(&hsd1);
+  HAL_Delay(10U);
+
+  if (HAL_SD_Init(&hsd1) != HAL_OK) return 0U;
+  if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B) != HAL_OK)
+    return 0U;
+
+  uint32_t start = HAL_GetTick();
+  while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+  {
+    if ((HAL_GetTick() - start) >= 1000U) return 0U;
+  }
+  Stat &= (DSTATUS)~STA_NOINIT;
+  return 1U;
+}
+
 DSTATUS SD_initialize(BYTE lun)
 {
   Stat = STA_NOINIT;
@@ -87,8 +130,7 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
   DRESULT res = RES_ERROR;
   if (HAL_SD_ReadBlocks(&hsd1, (uint8_t*)buff, sector, count, SD_TIMEOUT) == HAL_OK)
   {
-    while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER) {}
-    res = RES_OK;
+    if (SD_WaitForTransfer()) res = RES_OK;
   }
   return res;
 }
@@ -99,8 +141,7 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
   DRESULT res = RES_ERROR;
   if (HAL_SD_WriteBlocks(&hsd1, (uint8_t*)buff, sector, count, SD_TIMEOUT) == HAL_OK)
   {
-    while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER) {}
-    res = RES_OK;
+    if (SD_WaitForTransfer()) res = RES_OK;
   }
   return res;
 }
