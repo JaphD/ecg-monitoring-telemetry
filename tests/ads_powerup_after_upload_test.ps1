@@ -23,8 +23,10 @@ foreach ($item in $sequence) {
     $cursor = $position + $item.Length
 }
 
-if ($source -notmatch 'ADS start failed: ID=%lu') {
-    throw 'Recording transition must expose the failed ADS ID.'
+if (($source -notmatch 'ads_last_failed_id = ads_id_value') -or
+    ($source -notmatch 'ADS recovery: ID=%lu') -or
+    ($source -notmatch 'ads_recovery_reason')) {
+    throw 'Recording transition must expose the failed ADS ID through recovery diagnostics.'
 }
 
 Write-Output 'ADS power-up after boot upload contract: PASS'

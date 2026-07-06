@@ -36,7 +36,12 @@ static void MX_USART1_UART_Init(void);
 #define HTTP_RETRY_BACKOFF_MS      5000U
 #define UPLOAD_RETRY_IDLE_MS       60000U
 #define SD_RECORD_START_RETRY_MS   5000U
+#define ADS_START_RECOVERY_MS      5000U
 #define ADS_START_MAX_ATTEMPTS     3U
+#define ADS_RESTART_QUIET_MS       250U
+#define ADS_ID_READ_MAX_ATTEMPTS   5U
+#define ADS_ID_READ_RETRY_MS       75U
+#define ADS_START_DRDY_TIMEOUT_MS  200U
 #define ADS_CONFIG1_250_SPS        0x01U
 #define ADS_DRDY_FALLBACK_MS       40U
 #define ADS_POLL_INTERVAL_MS       4U
@@ -104,6 +109,10 @@ volatile uint32_t sd_logger_write_fault = 0U;
 volatile uint32_t sd_last_write_result = 0U;
 volatile uint32_t sd_write_retry_tick = 0U;
 volatile uint32_t sd_drain_failures = 0U;
+volatile uint32_t sd_recovery_required = 0U;
+volatile uint32_t sd_recovery_stage = 0U;
+volatile uint32_t sd_record_stall_recoveries = 0U;
+volatile uint32_t sd_active_abandoned = 0U;
 volatile uint32_t logger_start_result = 0U;
 volatile uint32_t logger_start_failures = 0U;
 volatile uint32_t sd_remount_attempts = 0U;
@@ -135,6 +144,14 @@ volatile uint32_t ads_poll_capture_count = 0U;
 volatile uint32_t ads_last_irq_tick = 0U;
 volatile uint32_t ads_start_attempts = 0U;
 volatile uint32_t ads_start_failures = 0U;
+volatile uint32_t ads_start_hard_failures = 0U;
+volatile uint32_t ads_recovery_cycles = 0U;
+volatile uint32_t ads_last_failed_id = 0U;
+volatile uint32_t ads_start_total_attempts = 0U;
+volatile uint32_t ads_start_successes = 0U;
+volatile uint32_t ads_start_id_failures = 0U;
+volatile uint32_t ads_start_config_failures = 0U;
+volatile uint32_t ads_start_drdy_failures = 0U;
 volatile uint32_t modem_boot_stage = 0U;
 volatile char last_modem_response[512] = {0};
 volatile char modem_boot_failure[64] = {0};
@@ -142,14 +159,19 @@ volatile char modem_boot_last_response[512] = {0};
 volatile char upload_failure_step[64] = {0};
 volatile char upload_failure_response[512] = {0};
 volatile char record_abort_reason[64] = {0};
+volatile char ads_recovery_reason[64] = {0};
 volatile char current_log_filename[32] = {0};
 volatile char current_upload_filename[32] = {0};
 
 static void Background_Service(void);
 static void ADS_CaptureFromISR(void);
 static void ADS_Service(void);
+static void LIS3DH_Service(void);
 static void Logger_RecoverQueue(void);
 static FRESULT Logger_SyncActiveFile(void);
+static void Handle_ADSStartFailure(void);
+static void Handle_SDRecordStall(void);
+static void Run_SDRecoveryIfNeeded(void);
 
 static uint8_t IsReadyFileName(const char *name)
 {
@@ -222,9 +244,21 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
 
     ADS_Command(0x11U); /* SDATAC */
     HAL_Delay(200U);
-    ads_id_value = ADS_ReadReg(0x00U);
+    ads_id_value = 0U;
+    for (uint32_t id_attempt = 1U; id_attempt <= ADS_ID_READ_MAX_ATTEMPTS; id_attempt++)
+    {
+        ads_id_value = ADS_ReadReg(0x00U);
+        if ((ads_id_value & 0x7FU) == 0x73U) break;
+        if (id_attempt < ADS_ID_READ_MAX_ATTEMPTS)
+        {
+            HAL_Delay(ADS_ID_READ_RETRY_MS);
+            ADS_Command(0x11U); /* SDATAC */
+            HAL_Delay(20U);
+        }
+    }
     if ((ads_id_value & 0x7FU) != 0x73U)
     {
+        ads_start_id_failures++;
         ads_stream_stage = 255U;
         return HAL_ERROR;
     }
@@ -242,6 +276,7 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
     ads_config1_readback = ADS_ReadReg(0x01U);
     if (ads_config1_readback != ADS_CONFIG1_250_SPS)
     {
+        ads_start_config_failures++;
         ads_stream_stage = 255U;
         return HAL_ERROR;
     }
@@ -274,6 +309,27 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
     ads_capture_mode = 1U;
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
     ads_has_started = 1U;
+
+    uint16_t start_head = ring_head;
+    uint32_t start_tick = HAL_GetTick();
+    while (((uint16_t)(ring_head - start_head) == 0U) &&
+           ((HAL_GetTick() - start_tick) < ADS_START_DRDY_TIMEOUT_MS))
+    {
+        ADS_Service();
+        LIS3DH_Service();
+        HAL_Delay(2U);
+    }
+    if ((uint16_t)(ring_head - start_head) == 0U)
+    {
+        ads_start_drdy_failures++;
+        ads_stream_stage = 255U;
+        acquisition_enabled = 0U;
+        ads_capture_mode = 0U;
+        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+        return HAL_ERROR;
+    }
+
+    ads_stream_stage = 100U;
     return HAL_OK;
 }
 
@@ -282,6 +338,8 @@ static HAL_StatusTypeDef ADS_StartAcquisition(void)
     for (uint32_t attempt = 1U; attempt <= ADS_START_MAX_ATTEMPTS; attempt++)
     {
         ads_start_attempts = attempt;
+        ads_start_total_attempts++;
+        HAL_Delay(ADS_RESTART_QUIET_MS);
         if (attempt > 1U)
         {
             (void)HAL_SPI_DeInit(&hspi1);
@@ -289,7 +347,11 @@ static HAL_StatusTypeDef ADS_StartAcquisition(void)
             if (HAL_SPI_Init(&hspi1) != HAL_OK) continue;
         }
 
-        if (ADS_ConfigureAndStartAttempt() == HAL_OK) return HAL_OK;
+        if (ADS_ConfigureAndStartAttempt() == HAL_OK)
+        {
+            ads_start_successes++;
+            return HAL_OK;
+        }
 
         ads_start_failures++;
         acquisition_enabled = 0U;
@@ -517,24 +579,40 @@ static FRESULT Logger_StartRecording(void)
 static FRESULT SD_RemountForLogger(void)
 {
     sd_remount_attempts++;
+    sd_recovery_stage = 20U;
     (void)f_mount(NULL, SDPath, 0U);
+    sd_recovery_stage = 30U;
     (void)HAL_SD_DeInit(&hsd1);
     HAL_Delay(20U);
 
+    sd_recovery_stage = 40U;
     if (HAL_SD_Init(&hsd1) != HAL_OK)
     {
         sd_remount_result = 1000U;
+        sd_recovery_stage = 255U;
         return FR_DISK_ERR;
     }
+    sd_recovery_stage = 50U;
     if (HAL_SD_ConfigWideBusOperation(&hsd1, SDMMC_BUS_WIDE_4B) != HAL_OK)
     {
         sd_remount_result = 1001U;
+        sd_recovery_stage = 255U;
         return FR_DISK_ERR;
     }
 
+    sd_recovery_stage = 60U;
     FRESULT result = f_mount(&SDFatFS, SDPath, 1U);
     sd_remount_result = (uint32_t)result;
-    if (result == FR_OK) Logger_RecoverQueue();
+    if (result == FR_OK)
+    {
+        sd_recovery_stage = 70U;
+        Logger_RecoverQueue();
+        sd_recovery_stage = 100U;
+    }
+    else
+    {
+        sd_recovery_stage = 255U;
+    }
     return result;
 }
 
@@ -1210,6 +1288,109 @@ static void Background_Service(void)
     if (!sd_upload_read_active) Logger_Drain(32U);
 }
 
+static void Handle_ADSStartFailure(void)
+{
+    ads_start_hard_failures++;
+    ads_recovery_cycles++;
+    ads_last_failed_id = ads_id_value;
+    snprintf((char *)ads_recovery_reason, sizeof(ads_recovery_reason),
+             "ADS start failed ID=%lu", (unsigned long)ads_last_failed_id);
+    snprintf((char *)record_abort_reason, sizeof(record_abort_reason),
+             "ADS start failed");
+
+    ADS_StopAcquisition();
+    acquisition_enabled = 0U;
+    ads_has_started = 0U;
+    ads_capture_mode = 0U;
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+
+    if (log_open)
+    {
+        (void)f_close(&log_file);
+        log_open = 0U;
+        current_log_filename[0] = '\0';
+        (void)f_unlink(ACTIVE_LOG_NAME);
+    }
+
+    ADS_CS(0U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(500U);
+    (void)HAL_SPI_DeInit(&hspi1);
+    HAL_Delay(20U);
+    (void)HAL_SPI_Init(&hspi1);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+
+    system_phase = 60U;
+    snprintf((char *)system_status, sizeof(system_status),
+             "ADS recovery: ID=%lu", (unsigned long)ads_last_failed_id);
+
+    uint32_t recovery_start = HAL_GetTick();
+    while ((HAL_GetTick() - recovery_start) < ADS_START_RECOVERY_MS)
+    {
+        LIS3DH_Service();
+        HAL_Delay(10U);
+    }
+}
+
+static void Handle_SDRecordStall(void)
+{
+    record_progress_timeouts++;
+    sd_record_stall_recoveries++;
+    sd_recovery_required = 1U;
+    sd_recovery_stage = 10U;
+    system_phase = 60U;
+    snprintf((char *)record_abort_reason, sizeof(record_abort_reason),
+             "Recording stalled");
+    snprintf((char *)system_status, sizeof(system_status),
+             "SD record stall; recovery queued");
+
+    ADS_StopAcquisition();
+    acquisition_enabled = 0U;
+    ads_capture_mode = 0U;
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+
+    if (log_open)
+    {
+        log_open = 0U;
+        current_log_filename[0] = '\0';
+        sd_active_abandoned++;
+    }
+
+    ring_tail = ring_head;
+    sd_logger_write_fault = 0U;
+    sd_write_retry_tick = HAL_GetTick();
+}
+
+static void Run_SDRecoveryIfNeeded(void)
+{
+    if (!sd_recovery_required) return;
+
+    system_phase = 60U;
+    snprintf((char *)system_status, sizeof(system_status), "SD recovery remount");
+
+    FRESULT result = SD_RemountForLogger();
+    if (result == FR_OK)
+    {
+        char active_path[32];
+        MakePath(active_path, sizeof(active_path), ACTIVE_LOG_NAME);
+        (void)f_unlink(active_path);
+        sd_logger_write_fault = 0U;
+        sd_last_write_result = 0U;
+        sd_recovery_required = 0U;
+        snprintf((char *)system_status, sizeof(system_status), "SD recovery complete");
+    }
+    else
+    {
+        sd_last_write_result = (uint32_t)result;
+        sd_logger_write_fault = 1U;
+        sd_write_retry_tick = HAL_GetTick();
+        snprintf((char *)system_status, sizeof(system_status),
+                 "SD recovery failed: %lu", (unsigned long)sd_last_write_result);
+    }
+}
+
 static void Run_RecordPhase(void)
 {
     system_phase = 20U;
@@ -1235,10 +1416,8 @@ static void Run_RecordPhase(void)
 
     if (ADS_StartAcquisition() != HAL_OK)
     {
-        system_phase = 255U;
-        snprintf((char *)system_status, sizeof(system_status),
-                 "ADS start failed: ID=%lu", (unsigned long)ads_id_value);
-        Error_Handler();
+        Handle_ADSStartFailure();
+        return;
     }
 
     uint32_t record_start = HAL_GetTick();
@@ -1260,20 +1439,7 @@ static void Run_RecordPhase(void)
         }
         else if ((HAL_GetTick() - record_last_progress_tick) >= RECORD_PROGRESS_TIMEOUT_MS)
         {
-            record_progress_timeouts++;
-            snprintf((char *)record_abort_reason, sizeof(record_abort_reason),
-                     "Recording stalled");
-            snprintf((char *)system_status, sizeof(system_status),
-                     "Recording stalled; SD recovery");
-            ADS_StopAcquisition();
-            if (log_open)
-            {
-                (void)f_close(&log_file);
-                log_open = 0U;
-                current_log_filename[0] = '\0';
-            }
-            (void)SD_RemountForLogger();
-            system_phase = 60U;
+            Handle_SDRecordStall();
             return;
         }
     }
@@ -1400,8 +1566,10 @@ int main(void)
 
     while (1)
     {
+        Run_SDRecoveryIfNeeded();
         Drain_UploadQueueBeforeNextRecord();
         Run_RecordPhase();
+        Run_SDRecoveryIfNeeded();
         Run_UploadPhase();
     }
 }
