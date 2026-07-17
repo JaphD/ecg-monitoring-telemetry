@@ -45,6 +45,7 @@ static void MX_USART1_UART_Init(void);
 #define ADS_CONFIG1_250_SPS        0x01U
 #define ADS_DRDY_FALLBACK_MS       40U
 #define ADS_POLL_INTERVAL_MS       4U
+#define MODEM_RAIL_SETTLE_MS       100U
 #define MAX_HTTPDATA_BYTES         100000U
 #define MODEM_APN                  "internet"
 #define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
@@ -153,8 +154,17 @@ volatile uint32_t ads_start_id_failures = 0U;
 volatile uint32_t ads_start_config_failures = 0U;
 volatile uint32_t ads_start_drdy_failures = 0U;
 volatile uint32_t modem_boot_stage = 0U;
+volatile uint32_t modem_power_requested = 0U;
+volatile uint32_t modem_power_state = 0U;
+volatile uint32_t modem_power_stage = 0U;
+volatile uint32_t modem_power_last_transition_tick = 0U;
+volatile uint32_t modem_power_enables = 0U;
+volatile uint32_t modem_power_disables = 0U;
+volatile uint32_t modem_power_cycles = 0U;
 volatile char last_modem_response[512] = {0};
 volatile char modem_boot_failure[64] = {0};
+volatile char modem_power_last_on_reason[64] = {0};
+volatile char modem_power_last_off_reason[64] = {0};
 volatile char modem_boot_last_response[512] = {0};
 volatile char upload_failure_step[64] = {0};
 volatile char upload_failure_response[512] = {0};
@@ -1022,6 +1032,49 @@ static uint8_t Modem_Boot(void)
     return 1U;
 }
 
+static void ModemPower_Enable(const char *reason)
+{
+    modem_power_requested = 1U;
+    if (modem_power_state != 0U) return;
+
+    modem_power_stage = 10U;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    HAL_Delay(MODEM_RAIL_SETTLE_MS);
+    modem_power_state = 1U;
+    modem_power_enables++;
+    modem_power_last_transition_tick = HAL_GetTick();
+    snprintf((char *)modem_power_last_on_reason,
+             sizeof(modem_power_last_on_reason), "%s", reason);
+}
+
+static void ModemPower_Disable(const char *reason)
+{
+    modem_power_requested = 0U;
+    Modem_StopRx();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+    HAL_Delay(MODEM_RAIL_SETTLE_MS);
+    if (modem_power_state != 0U) modem_power_disables++;
+    modem_power_state = 0U;
+    modem_power_stage = 0U;
+    modem_power_last_transition_tick = HAL_GetTick();
+    snprintf((char *)modem_power_last_off_reason,
+             sizeof(modem_power_last_off_reason), "%s", reason);
+}
+
+static uint8_t ModemPower_BootForUpload(void)
+{
+    modem_power_cycles++;
+    ModemPower_Enable("upload queue");
+    modem_power_stage = 20U;
+    if (!Modem_Boot())
+    {
+        ModemPower_Disable("modem boot failed");
+        return 0U;
+    }
+    modem_power_stage = 30U;
+    return 1U;
+}
+
 static void Upload_CaptureFailure(const char *step)
 {
     snprintf((char *)upload_failure_step, sizeof(upload_failure_step), "%s", step);
@@ -1488,6 +1541,16 @@ static void Run_UploadPhase(void)
     }
 
     Logger_RecoverQueue();
+    if (sd_files_queued == 0U)
+    {
+        modem_power_stage = 0U;
+        return;
+    }
+    if (!ModemPower_BootForUpload())
+    {
+        system_phase = 50U;
+        return;
+    }
     system_phase = 40U;
     snprintf((char *)system_status, sizeof(system_status),
              "Uploading %lu queued files", (unsigned long)sd_files_queued);
@@ -1502,6 +1565,7 @@ static void Run_UploadPhase(void)
             snprintf((char *)system_status, sizeof(system_status),
                      "Upload deferred; %lu files queued",
                      (unsigned long)sd_files_queued);
+            ModemPower_Disable("upload deferred");
             return;
         }
     }
@@ -1509,6 +1573,7 @@ static void Run_UploadPhase(void)
     upload_phases_completed++;
     system_phase = 100U;
     snprintf((char *)system_status, sizeof(system_status), "Upload queue drained");
+    ModemPower_Disable("upload complete");
 }
 
 static void Drain_UploadQueueBeforeNextRecord(void)
@@ -1534,6 +1599,7 @@ static void Drain_UploadQueueBeforeNextRecord(void)
                  (unsigned long)sd_files_queued);
 
         uint32_t start = HAL_GetTick();
+        ModemPower_Disable("upload retry");
         while ((HAL_GetTick() - start) < UPLOAD_RETRY_IDLE_MS)
         {
             LIS3DH_Service();
@@ -1558,9 +1624,6 @@ int main(void)
     if (f_mount(&SDFatFS, SDPath, 1U) != FR_OK) Error_Handler();
     Logger_RecoverQueue();
     if (LIS3DH_Init() != HAL_OK) Error_Handler();
-
-    snprintf((char *)system_status, sizeof(system_status), "Connecting modem");
-    if (!Modem_Boot()) Error_Handler();
 
     Drain_UploadQueueBeforeNextRecord();
 
