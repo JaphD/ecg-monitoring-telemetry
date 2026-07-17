@@ -81,7 +81,7 @@ enum
 enum
 {
     ADS_RESULT_PENDING = 0U,
-    ADS_RESULT_INTERNAL_TESTS_PASSED = 1U,
+    ADS_RESULT_CAPTURE_ACTIVE = 1U,
     ADS_RESULT_FAILED = 2U
 };
 
@@ -187,10 +187,19 @@ volatile int32_t ads_external_ch2_max = INT32_MIN;
 volatile uint32_t ads_external_saturation_count = 0U;
 volatile uint32_t ads_external_buffer_index = 0U;
 volatile uint32_t ads_external_buffer_sequence = 0U;
+volatile uint32_t ads_external_stats_sequence = 0U;
+volatile int32_t ads_external_ch1_buffer_min = 0;
+volatile int32_t ads_external_ch1_buffer_max = 0;
+volatile int32_t ads_external_ch1_buffer_mean = 0;
+volatile int32_t ads_external_ch1_buffer_pp = 0;
+volatile int32_t ads_external_ch2_buffer_min = 0;
+volatile int32_t ads_external_ch2_buffer_max = 0;
+volatile int32_t ads_external_ch2_buffer_mean = 0;
+volatile int32_t ads_external_ch2_buffer_pp = 0;
 volatile int32_t ads_external_ch1_buffer[ADS_BUFFER_LENGTH] = {0};
 volatile int32_t ads_external_ch2_buffer[ADS_BUFFER_LENGTH] = {0};
 
-static uint32_t ads_previous_drdy_us = 0U;
+static uint32_t ads_previous_drdy_cycles = 0U;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -218,10 +227,10 @@ static void ADS_Fail(uint32_t code, const char *text)
     ADS_SetStatus(text);
 }
 
-static uint32_t ADS_Micros(void)
+static uint32_t ADS_CyclesToMicroseconds(uint32_t cycles)
 {
     uint32_t cycles_per_us = HAL_RCC_GetHCLKFreq() / 1000000U;
-    return (cycles_per_us == 0U) ? 0U : DWT->CYCCNT / cycles_per_us;
+    return (cycles_per_us == 0U) ? 0U : cycles / cycles_per_us;
 }
 
 static int32_t ADS_SignExtend24(const uint8_t bytes[3])
@@ -363,7 +372,7 @@ static bool ADS_WaitForPin(GPIO_PinState state, uint32_t timeout_ms)
 
 static bool ADS_WaitAndReadFrame(uint8_t frame[9])
 {
-    uint32_t now_us;
+    uint32_t now_cycles;
     if (!ADS_WaitForPin(GPIO_PIN_RESET, ADS_DRDY_TIMEOUT_MS))
     {
         ads_drdy_low_timeout_count++;
@@ -371,14 +380,15 @@ static bool ADS_WaitAndReadFrame(uint8_t frame[9])
         ADS_Fail(ADS_FAILURE_DRDY_TIMEOUT, "DRDY low timeout");
         return false;
     }
-    now_us = ADS_Micros();
-    if (ads_previous_drdy_us != 0U)
+    now_cycles = DWT->CYCCNT;
+    if (ads_previous_drdy_cycles != 0U)
     {
-        uint32_t interval = now_us - ads_previous_drdy_us;
+        uint32_t interval = ADS_CyclesToMicroseconds(
+            now_cycles - ads_previous_drdy_cycles);
         if (interval < ads_drdy_interval_min_us) ads_drdy_interval_min_us = interval;
         if (interval > ads_drdy_interval_max_us) ads_drdy_interval_max_us = interval;
     }
-    ads_previous_drdy_us = now_us;
+    ads_previous_drdy_cycles = now_cycles;
     if (ADS_ReadFrame(frame) != HAL_OK)
     {
         ADS_Fail(ADS_FAILURE_SPI, "SPI frame read failed");
@@ -491,7 +501,7 @@ static bool ADS_StopContinuous(void)
 
 static bool ADS_StartContinuous(void)
 {
-    ads_previous_drdy_us = 0U;
+    ads_previous_drdy_cycles = 0U;
     if (ADS_Command(ADS_CMD_START) != HAL_OK) return false;
     HAL_Delay(10U);
     if (ADS_Command(ADS_CMD_RDATAC) != HAL_OK) return false;
@@ -589,8 +599,8 @@ static bool ADS_Collect(uint32_t target, ADS_Stats *ch1_stats,
                         uint32_t *ch2_transitions)
 {
     uint8_t frame[9];
-    uint32_t start_us = ADS_Micros();
-    uint32_t end_us;
+    uint32_t start_cycles = DWT->CYCCNT;
+    uint32_t end_cycles;
     int32_t previous_ch1 = 0;
     int32_t previous_ch2 = 0;
     uint32_t i;
@@ -617,12 +627,13 @@ static bool ADS_Collect(uint32_t target, ADS_Stats *ch1_stats,
         previous_ch2 = ch2;
         ads_sample_count++;
     }
-    end_us = ADS_Micros();
-    if (end_us != start_us)
+    end_cycles = DWT->CYCCNT;
+    if (end_cycles != start_cycles)
     {
+        uint32_t elapsed_cycles = end_cycles - start_cycles;
         ads_measured_rate_millihz =
-            (uint32_t)(((uint64_t)target * 1000000000ULL) /
-                       (uint32_t)(end_us - start_us));
+            (uint32_t)(((uint64_t)target * HAL_RCC_GetHCLKFreq() * 1000ULL) /
+                       elapsed_cycles);
     }
     return true;
 }
@@ -761,7 +772,7 @@ static bool ADS_InternalSignalTest(void)
     ads_internal_test_pass =
         (ADS_InternalStatsPass(&ch1, transitions_ch1) &&
          ADS_InternalStatsPass(&ch2, transitions_ch2)) ? 1U : 0U;
-    ads_test_result = ADS_RESULT_INTERNAL_TESTS_PASSED;
+    ads_test_result = ADS_RESULT_CAPTURE_ACTIVE;
     return true;
 }
 
@@ -786,12 +797,19 @@ static bool ADS_ExternalSetup(void)
         return false;
     }
     ads_external_active = 1U;
+    ads_test_result = ADS_RESULT_CAPTURE_ACTIVE;
     return true;
 }
 
 static void ADS_ExternalCapture(void)
 {
     uint8_t frame[9];
+    int32_t ch1_buffer_min = INT32_MAX;
+    int32_t ch1_buffer_max = INT32_MIN;
+    int32_t ch2_buffer_min = INT32_MAX;
+    int32_t ch2_buffer_max = INT32_MIN;
+    int64_t ch1_buffer_sum = 0;
+    int64_t ch2_buffer_sum = 0;
     while (1)
     {
         uint32_t index;
@@ -815,11 +833,35 @@ static void ADS_ExternalCapture(void)
         index = ads_external_buffer_index;
         ads_external_ch1_buffer[index] = ch1;
         ads_external_ch2_buffer[index] = ch2;
+        if (ch1 < ch1_buffer_min) ch1_buffer_min = ch1;
+        if (ch1 > ch1_buffer_max) ch1_buffer_max = ch1;
+        if (ch2 < ch2_buffer_min) ch2_buffer_min = ch2;
+        if (ch2 > ch2_buffer_max) ch2_buffer_max = ch2;
+        ch1_buffer_sum += ch1;
+        ch2_buffer_sum += ch2;
         index++;
         if (index >= ADS_BUFFER_LENGTH)
         {
             index = 0U;
             ads_external_buffer_sequence++;
+            ads_external_ch1_buffer_min = ch1_buffer_min;
+            ads_external_ch1_buffer_max = ch1_buffer_max;
+            ads_external_ch1_buffer_mean =
+                (int32_t)(ch1_buffer_sum / (int64_t)ADS_BUFFER_LENGTH);
+            ads_external_ch1_buffer_pp = ch1_buffer_max - ch1_buffer_min;
+            ads_external_ch2_buffer_min = ch2_buffer_min;
+            ads_external_ch2_buffer_max = ch2_buffer_max;
+            ads_external_ch2_buffer_mean =
+                (int32_t)(ch2_buffer_sum / (int64_t)ADS_BUFFER_LENGTH);
+            ads_external_ch2_buffer_pp = ch2_buffer_max - ch2_buffer_min;
+            ads_external_stats_sequence = ads_external_buffer_sequence;
+
+            ch1_buffer_min = INT32_MAX;
+            ch1_buffer_max = INT32_MIN;
+            ch2_buffer_min = INT32_MAX;
+            ch2_buffer_max = INT32_MIN;
+            ch1_buffer_sum = 0;
+            ch2_buffer_sum = 0;
         }
         ads_external_buffer_index = index;
         ads_sample_count++;
