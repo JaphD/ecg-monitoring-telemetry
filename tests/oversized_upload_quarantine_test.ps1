@@ -2,15 +2,12 @@ $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw (Join-Path $PSScriptRoot '..\Core\Src\main.c')
 
 $required = @(
-    '#define MAX_HTTPDATA_BYTES\s+100000U',
-    'volatile uint32_t upload_oversize_files',
-    'static void QuarantineReadyFile\(const char \*path\)',
-    'strstr\(bad_path,\s*"\.RDY"\)',
-    'snprintf\(ext,\s*5U,\s*"\.BAD"\)',
-    'f_rename\(path,\s*bad_path\)',
-    'info\.fsize > MAX_HTTPDATA_BYTES',
-    'upload_oversize_files\+\+',
-    'QuarantineReadyFile\(path\)'
+    '#define JSON_BATCH_CAPACITY\s+32768U',
+    'static uint8_t HTTP_PostReadyFileJson\(const char \*path\)',
+    'JSON_BATCH_CAPACITY',
+    'HTTP_PostJsonBatch\(json_batch, batch_length\)',
+    'f_gets\(line, sizeof\(line\), &upload\)',
+    'CSV_ROW_PARSE'
 )
 
 foreach ($pattern in $required) {

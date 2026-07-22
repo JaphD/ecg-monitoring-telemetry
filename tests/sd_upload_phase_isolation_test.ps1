@@ -17,13 +17,14 @@ foreach ($pattern in $mainPatterns) {
     }
 }
 
-$postStart = $main.IndexOf('static uint8_t HTTP_PostFile(const char *path)')
+$postStart = $main.IndexOf('static uint8_t HTTP_PostReadyFileJson(const char *path)')
 $postEnd = $main.IndexOf('static void Upload_OldestReady(void)', $postStart)
 $post = $main.Substring($postStart, $postEnd - $postStart)
 $close = $post.IndexOf('f_close(&upload)')
-$dataAck = $post.IndexOf('Modem_Wait("OK", 65000U')
-if (($close -lt 0) -or ($dataAck -lt 0) -or ($close -gt $dataAck)) {
-    throw 'The upload file must be closed before waiting for the modem data ACK.'
+$readActive = $post.IndexOf('sd_upload_read_active = 1U')
+$postBatch = $post.IndexOf('HTTP_PostJsonBatch(json_batch, batch_length)')
+if (($close -lt 0) -or ($readActive -lt 0) -or ($postBatch -lt 0) -or ($readActive -gt $close)) {
+    throw 'JSON conversion must isolate SD reads until the ready file is closed.'
 }
 
 if ($disk -notmatch 'SD_WaitForTransfer') {
