@@ -32,6 +32,9 @@ if (($upload -lt 0) -or ($jsonUpload -lt 0) -or ($jsonUpload -gt $upload)) {
 if ($source -notmatch 'NetworkTime_Sync\(\)') {
   throw 'The modem boot path must synchronize network time before V1 upload.'
 }
+if ($source -match 'if \(!network_time_valid\)\s*\{\s*Upload_CaptureFailure\("NETWORK_TIME_UNSYNCED"\)') {
+  throw 'An invalid modem clock must use the server-time fallback, not block JSON upload.'
+}
 
 $server = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\server.js')
 if ($server -notmatch 'timestamp > 0 \? timestamp : Date\.now\(\)') {

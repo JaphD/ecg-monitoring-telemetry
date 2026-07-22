@@ -1252,11 +1252,6 @@ static uint8_t HTTP_PostReadyFileJson(const char *path)
     uint32_t batch_length, batch_rows = 0U;
     uint8_t success = 0U;
 
-    if (!network_time_valid)
-    {
-        Upload_CaptureFailure("NETWORK_TIME_UNSYNCED");
-        return 0U;
-    }
     sd_upload_read_active = 1U;
     if (f_open(&upload, path, FA_READ) != FR_OK)
     {
