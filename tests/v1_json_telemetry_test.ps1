@@ -8,7 +8,10 @@ $required = @(
   'DeviceId_Init',
   'HTTP_PostJsonBatch',
   'HTTP_PostReadyFileJson',
-  'AT+CCLK?',
+  'Modem_Command("AT+CCLK?\r\n", "+CCLK:", 5000U, 1U)',
+  'network_time_fallback_uploads++',
+  'network_time_valid ? (uint64_t)',
+  'year < 24', 'year > 40',
   'application/json',
   'stm32l452-%08lX%08lX%08lX',
   "json_batch[batch_length++] = ']'",
@@ -28,6 +31,11 @@ if (($upload -lt 0) -or ($jsonUpload -lt 0) -or ($jsonUpload -gt $upload)) {
 
 if ($source -notmatch 'NetworkTime_Sync\(\)') {
   throw 'The modem boot path must synchronize network time before V1 upload.'
+}
+
+$server = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\server.js')
+if ($server -notmatch 'timestamp > 0 \? timestamp : Date\.now\(\)') {
+  throw 'The dashboard server must replace an unsynchronized timestamp sentinel with server UTC.'
 }
 
 Write-Output 'V1 JSON telemetry contract: PASS'

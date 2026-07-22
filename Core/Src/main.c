@@ -163,6 +163,7 @@ volatile uint32_t modem_power_cycles = 0U;
 volatile uint32_t network_time_valid = 0U;
 volatile uint32_t network_time_syncs = 0U;
 volatile uint32_t network_time_failures = 0U;
+volatile uint32_t network_time_fallback_uploads = 0U;
 volatile uint32_t network_time_reference_tick = 0U;
 volatile uint64_t network_time_epoch_ms = 0U;
 volatile char last_modem_response[512] = {0};
@@ -1066,7 +1067,7 @@ static uint8_t NetworkTime_Sync(void)
 {
     int year, month, day, hour, minute, second, timezone_quarters;
     snprintf((char *)system_status, sizeof(system_status), "Modem: network time sync");
-    if (!Modem_Command("AT+CCLK?\r\n", "+CCLK:", 5000U, 0U)) goto failed;
+    if (!Modem_Command("AT+CCLK?\r\n", "+CCLK:", 5000U, 1U)) goto failed;
     strncpy((char *)network_time_last_response, (const char *)last_modem_response,
             sizeof(network_time_last_response) - 1U);
     network_time_last_response[sizeof(network_time_last_response) - 1U] = '\0';
@@ -1074,7 +1075,8 @@ static uint8_t NetworkTime_Sync(void)
                "%*[^\"]\"%2d/%2d/%2d,%2d:%2d:%2d%3d\"",
                &year, &month, &day, &hour, &minute, &second, &timezone_quarters) != 7)
         goto failed;
-    if ((month < 1) || (month > 12) || (day < 1) || (day > 31) ||
+    if ((year < 24) || (year > 40) ||
+        (month < 1) || (month > 12) || (day < 1) || (day > 31) ||
         (hour > 23) || (minute > 59) || (second > 59)) goto failed;
 
     network_time_epoch_ms = (uint64_t)((int64_t)NetworkTime_EpochMs((uint32_t)(2000 + year),
@@ -1099,7 +1101,7 @@ failed:
 static uint64_t NetworkTime_TimestampForTick(uint32_t sample_tick)
 {
     int32_t elapsed_ms = (int32_t)(sample_tick - network_time_reference_tick);
-    return (uint64_t)((int64_t)network_time_epoch_ms + elapsed_ms);
+    return network_time_valid ? (uint64_t)((int64_t)network_time_epoch_ms + elapsed_ms) : 0U;
 }
 
 static void ModemPower_Enable(const char *reason)
@@ -1141,11 +1143,7 @@ static uint8_t ModemPower_BootForUpload(void)
         ModemPower_Disable("modem boot failed");
         return 0U;
     }
-    if (!NetworkTime_Sync())
-    {
-        ModemPower_Disable("network time failed");
-        return 0U;
-    }
+    if (!NetworkTime_Sync()) network_time_fallback_uploads++;
     modem_power_stage = 30U;
     return 1U;
 }
