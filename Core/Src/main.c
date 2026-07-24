@@ -47,10 +47,12 @@ static void MX_USART1_UART_Init(void);
 #define ADS_POLL_INTERVAL_MS       4U
 #define MODEM_RAIL_SETTLE_MS       100U
 #define JSON_BATCH_CAPACITY        32768U
+#define JSON_READINGS_PER_BATCH    250U
 #define MODEM_HTTP_TX_CHUNK_SIZE   512U
 #define MODEM_HTTP_TX_PACING_MS    2U
 #define MODEM_APN                  "internet"
 #define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
+#define SERVER_TIME_URL            "https://carton-cupping-modify.ngrok-free.dev/api/time"
 #define ACTIVE_LOG_NAME            "ACTIVE.TMP"
 #define CSV_HEADER                 "timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n"
 
@@ -169,8 +171,17 @@ volatile uint32_t network_time_valid = 0U;
 volatile uint32_t network_time_syncs = 0U;
 volatile uint32_t network_time_failures = 0U;
 volatile uint32_t network_time_fallback_uploads = 0U;
+volatile uint32_t network_time_source = 0U; /* 0=invalid, 1=CCLK, 2=server */
+volatile uint32_t modem_clock_failures = 0U;
+volatile uint32_t server_time_syncs = 0U;
+volatile uint32_t server_time_failures = 0U;
+volatile uint32_t server_time_round_trip_ms = 0U;
 volatile uint32_t network_time_reference_tick = 0U;
 volatile uint64_t network_time_epoch_ms = 0U;
+volatile uint32_t current_upload_batch_index = 0U;
+volatile uint32_t upload_batches_ok = 0U;
+volatile uint32_t upload_batch_retries = 0U;
+volatile uint32_t upload_batch_failures = 0U;
 volatile char last_modem_response[512] = {0};
 volatile char modem_boot_failure[64] = {0};
 volatile char modem_power_last_on_reason[64] = {0};
@@ -184,6 +195,9 @@ volatile char current_log_filename[32] = {0};
 volatile char current_upload_filename[32] = {0};
 volatile char device_id[40] = {0};
 volatile char network_time_last_response[96] = {0};
+volatile char modem_clock_last_response[96] = {0};
+volatile char server_time_last_response[160] = {0};
+volatile char current_upload_file_id[32] = {0};
 
 static void Background_Service(void);
 static void ADS_CaptureFromISR(void);
@@ -1068,21 +1082,45 @@ static void DeviceId_Init(void)
              (unsigned long)HAL_GetUIDw2());
 }
 
-static uint8_t NetworkTime_Sync(void)
+static uint8_t ParseUint64Field(const char *text, const char *field,
+                                uint64_t *value)
+{
+    const char *cursor = strstr(text, field);
+    uint64_t parsed = 0U;
+    uint8_t digits = 0U;
+    if (cursor == NULL) return 0U;
+    cursor += strlen(field);
+    while ((*cursor == ' ') || (*cursor == '\t') || (*cursor == ':')) cursor++;
+    while ((*cursor >= '0') && (*cursor <= '9'))
+    {
+        parsed = parsed * 10U + (uint64_t)(*cursor - '0');
+        cursor++;
+        digits++;
+    }
+    if (digits == 0U) return 0U;
+    *value = parsed;
+    return 1U;
+}
+
+static uint8_t ModemClock_Sync(void)
 {
     int year, month, day, hour, minute, second, timezone_quarters;
-    snprintf((char *)system_status, sizeof(system_status), "Modem: network time sync");
-    if (!Modem_Command("AT+CCLK?\r\n", "+CCLK:", 5000U, 1U)) goto failed;
+    snprintf((char *)system_status, sizeof(system_status), "Modem: CCLK time sync");
+    if (!Modem_Command("AT+CCLK?\r\n", "+CCLK:", 5000U, 1U)) return 0U;
+    strncpy((char *)modem_clock_last_response,
+            (const char *)last_modem_response,
+            sizeof(modem_clock_last_response) - 1U);
+    modem_clock_last_response[sizeof(modem_clock_last_response) - 1U] = '\0';
     strncpy((char *)network_time_last_response, (const char *)last_modem_response,
             sizeof(network_time_last_response) - 1U);
     network_time_last_response[sizeof(network_time_last_response) - 1U] = '\0';
     if (sscanf((const char *)last_modem_response,
                "%*[^\"]\"%2d/%2d/%2d,%2d:%2d:%2d%3d\"",
                &year, &month, &day, &hour, &minute, &second, &timezone_quarters) != 7)
-        goto failed;
+        return 0U;
     if ((year < 24) || (year > 40) ||
         (month < 1) || (month > 12) || (day < 1) || (day > 31) ||
-        (hour > 23) || (minute > 59) || (second > 59)) goto failed;
+        (hour > 23) || (minute > 59) || (second > 59)) return 0U;
 
     network_time_epoch_ms = (uint64_t)((int64_t)NetworkTime_EpochMs((uint32_t)(2000 + year),
                                                                       (uint32_t)month, (uint32_t)day,
@@ -1091,15 +1129,86 @@ static uint8_t NetworkTime_Sync(void)
                                        (int64_t)timezone_quarters * 15LL * 60LL * 1000LL);
     network_time_reference_tick = HAL_GetTick();
     network_time_valid = 1U;
+    network_time_source = 1U;
     network_time_syncs++;
     return 1U;
+}
 
-failed:
-    network_time_valid = 0U;
-    network_time_failures++;
-    strncpy((char *)network_time_last_response, (const char *)last_modem_response,
+static uint8_t ServerTime_Sync(void)
+{
+    char command[200];
+    uint8_t success = 0U;
+    uint32_t request_start_tick = 0U;
+    uint32_t request_end_tick = 0U;
+    uint64_t epoch_ms = 0U;
+
+    snprintf((char *)system_status, sizeof(system_status), "Modem: server time sync");
+    (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
+    if (!Modem_Command("AT+HTTPINIT\r\n", "OK", 5000U, 0U)) goto done;
+    snprintf(command, sizeof(command), "AT+HTTPPARA=\"URL\",\"%s\"\r\n",
+             SERVER_TIME_URL);
+    if (!Modem_Command(command, "OK", 5000U, 0U)) goto terminate;
+
+    request_start_tick = HAL_GetTick();
+    if (!Modem_Command("AT+HTTPACTION=0\r\n", "+HTTPACTION:", 65000U, 1U))
+        goto terminate;
+    {
+        const char *action = strstr((const char *)last_modem_response,
+                                    "+HTTPACTION:");
+        unsigned long status = 0U, response_length = 0U;
+        if ((action == NULL) ||
+            (sscanf(action, "+HTTPACTION: %*u,%lu,%lu",
+                    &status, &response_length) != 2) ||
+            (status != 200U) || (response_length == 0U))
+            goto terminate;
+    }
+    if (!Modem_Command("AT+HTTPREAD=0,128\r\n", "OK", 5000U, 1U))
+        goto terminate;
+    request_end_tick = HAL_GetTick();
+    strncpy((char *)server_time_last_response, (const char *)last_modem_response,
+            sizeof(server_time_last_response) - 1U);
+    server_time_last_response[sizeof(server_time_last_response) - 1U] = '\0';
+    if (!ParseUint64Field((const char *)last_modem_response,
+                          "\"epoch_ms\"", &epoch_ms))
+        goto terminate;
+
+    server_time_round_trip_ms = request_end_tick - request_start_tick;
+    network_time_epoch_ms = epoch_ms;
+    network_time_reference_tick =
+        request_start_tick + (server_time_round_trip_ms / 2U);
+    network_time_valid = 1U;
+    network_time_source = 2U;
+    network_time_syncs++;
+    server_time_syncs++;
+    strncpy((char *)network_time_last_response,
+            (const char *)server_time_last_response,
             sizeof(network_time_last_response) - 1U);
     network_time_last_response[sizeof(network_time_last_response) - 1U] = '\0';
+    success = 1U;
+
+terminate:
+    (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
+done:
+    if (!success)
+    {
+        server_time_failures++;
+        strncpy((char *)server_time_last_response,
+                (const char *)last_modem_response,
+                sizeof(server_time_last_response) - 1U);
+        server_time_last_response[sizeof(server_time_last_response) - 1U] = '\0';
+    }
+    return success;
+}
+
+static uint8_t NetworkTime_Sync(void)
+{
+    if (ModemClock_Sync()) return 1U;
+    modem_clock_failures++;
+    if (ServerTime_Sync()) return 1U;
+
+    network_time_valid = 0U;
+    network_time_source = 0U;
+    network_time_failures++;
     return 0U;
 }
 
@@ -1283,12 +1392,69 @@ done:
     return success;
 }
 
+static uint8_t HTTP_PostJsonBatchWithRetry(const char *payload,
+                                           uint32_t payload_size,
+                                           uint32_t batch_index)
+{
+    current_upload_batch_index = batch_index;
+    for (uint32_t attempt = 1U; attempt <= HTTP_MAX_ATTEMPTS; attempt++)
+    {
+        if (attempt > 1U) upload_batch_retries++;
+        if (HTTP_PostJsonBatch(payload, payload_size))
+        {
+            upload_batches_ok++;
+            return 1U;
+        }
+        if (attempt < HTTP_MAX_ATTEMPTS)
+        {
+            uint32_t retry_start = HAL_GetTick();
+            while ((HAL_GetTick() - retry_start) < HTTP_RETRY_BACKOFF_MS)
+            {
+                Background_Service();
+                HAL_Delay(1U);
+            }
+        }
+    }
+    upload_batch_failures++;
+    return 0U;
+}
+
+static uint8_t File_ComputeId(FIL *file, char *file_id, size_t capacity)
+{
+    uint8_t data[256];
+    UINT bytes_read = 0U;
+    uint32_t hash = 2166136261U;
+    FSIZE_t original_position = f_tell(file);
+    FSIZE_t file_size = f_size(file);
+
+    if (f_lseek(file, 0U) != FR_OK) return 0U;
+    do
+    {
+        if (f_read(file, data, sizeof(data), &bytes_read) != FR_OK)
+        {
+            (void)f_lseek(file, original_position);
+            return 0U;
+        }
+        for (UINT i = 0U; i < bytes_read; i++)
+        {
+            hash ^= data[i];
+            hash *= 16777619U;
+        }
+    } while (bytes_read > 0U);
+    if (f_lseek(file, original_position) != FR_OK) return 0U;
+
+    int length = snprintf(file_id, capacity, "%08lX-%lu",
+                          (unsigned long)hash, (unsigned long)file_size);
+    return ((length > 0) && ((size_t)length < capacity)) ? 1U : 0U;
+}
+
 static uint8_t HTTP_PostReadyFileJson(const char *path)
 {
     FIL upload;
     char line[96];
+    char file_id[32];
     static char json_batch[JSON_BATCH_CAPACITY];
-    uint32_t batch_length, batch_rows = 0U;
+    uint32_t batch_length, batch_rows = 0U, batch_index = 0U, total_rows = 0U;
     uint8_t success = 0U;
 
     sd_upload_read_active = 1U;
@@ -1298,15 +1464,31 @@ static uint8_t HTTP_PostReadyFileJson(const char *path)
         Upload_CaptureFailure("FILE_OPEN");
         return 0U;
     }
+    if (!File_ComputeId(&upload, file_id, sizeof(file_id)))
+    {
+        Upload_CaptureFailure("FILE_ID");
+        goto done;
+    }
+    snprintf((char *)current_upload_file_id,
+             sizeof(current_upload_file_id), "%s", file_id);
     if (f_gets(line, sizeof(line), &upload) == NULL)
     {
         Upload_CaptureFailure("CSV_HEADER_READ");
         goto done;
     }
 
-    batch_length = (uint32_t)snprintf(json_batch, sizeof(json_batch),
-                                      "{\"device_id\":\"%s\",\"readings\":[",
-                                      (const char *)device_id);
+    {
+        int header_length = snprintf(
+            json_batch, sizeof(json_batch),
+            "{\"device_id\":\"%s\",\"file_id\":\"%s\",\"batch_index\":%lu,\"readings\":[",
+            (const char *)device_id, file_id, (unsigned long)batch_index);
+        if ((header_length <= 0) || ((size_t)header_length >= sizeof(json_batch)))
+        {
+            Upload_CaptureFailure("JSON_HEADER");
+            goto done;
+        }
+        batch_length = (uint32_t)header_length;
+    }
     while (f_gets(line, sizeof(line), &upload) != NULL)
     {
         unsigned long tick;
@@ -1335,33 +1517,56 @@ static uint8_t HTTP_PostReadyFileJson(const char *path)
             Upload_CaptureFailure("JSON_ROW_FORMAT");
             goto done;
         }
-        if ((batch_length + (batch_rows ? 1U : 0U) + (uint32_t)row_length + 2U) >=
-            JSON_BATCH_CAPACITY)
+        if ((batch_length + (batch_rows ? 1U : 0U) +
+             (uint32_t)row_length + 2U) >= JSON_BATCH_CAPACITY)
         {
-            if (batch_rows == 0U)
-                goto done;
-            json_batch[batch_length++] = ']';
-            json_batch[batch_length++] = '}';
-            json_batch[batch_length] = '\0';
-            if (!HTTP_PostJsonBatch(json_batch, batch_length)) goto done;
-            batch_length = (uint32_t)snprintf(json_batch, sizeof(json_batch),
-                                              "{\"device_id\":\"%s\",\"readings\":[",
-                                              (const char *)device_id);
-            batch_rows = 0U;
+            Upload_CaptureFailure("JSON_BATCH_OVERFLOW");
+            goto done;
         }
         if (batch_rows > 0U) json_batch[batch_length++] = ',';
         memcpy(json_batch + batch_length, row, (size_t)row_length);
         batch_length += (uint32_t)row_length;
         batch_rows++;
+        total_rows++;
+
+        if (batch_rows >= JSON_READINGS_PER_BATCH)
+        {
+            json_batch[batch_length++] = ']';
+            json_batch[batch_length++] = '}';
+            json_batch[batch_length] = '\0';
+            if (!HTTP_PostJsonBatchWithRetry(json_batch, batch_length,
+                                             batch_index))
+                goto done;
+            batch_index++;
+            batch_rows = 0U;
+            int header_length = snprintf(
+                json_batch, sizeof(json_batch),
+                "{\"device_id\":\"%s\",\"file_id\":\"%s\",\"batch_index\":%lu,\"readings\":[",
+                (const char *)device_id, file_id, (unsigned long)batch_index);
+            if ((header_length <= 0) ||
+                ((size_t)header_length >= sizeof(json_batch)))
+            {
+                Upload_CaptureFailure("JSON_HEADER");
+                goto done;
+            }
+            batch_length = (uint32_t)header_length;
+        }
     }
-    if (batch_rows == 0U)
+    if (total_rows == 0U)
     {
         Upload_CaptureFailure("CSV_NO_ROWS");
         goto done;
     }
-    batch_length += (uint32_t)snprintf(json_batch + batch_length,
-                                       sizeof(json_batch) - batch_length, "]}");
-    success = HTTP_PostJsonBatch(json_batch, batch_length);
+    if (batch_rows > 0U)
+    {
+        json_batch[batch_length++] = ']';
+        json_batch[batch_length++] = '}';
+        json_batch[batch_length] = '\0';
+        if (!HTTP_PostJsonBatchWithRetry(json_batch, batch_length,
+                                         batch_index))
+            goto done;
+    }
+    success = 1U;
 
 done:
     (void)f_close(&upload);

@@ -22,7 +22,7 @@ $postEnd = $main.IndexOf('static void Upload_OldestReady(void)', $postStart)
 $post = $main.Substring($postStart, $postEnd - $postStart)
 $close = $post.IndexOf('f_close(&upload)')
 $readActive = $post.IndexOf('sd_upload_read_active = 1U')
-$postBatch = $post.IndexOf('HTTP_PostJsonBatch(json_batch, batch_length)')
+$postBatch = $post.IndexOf('HTTP_PostJsonBatchWithRetry(json_batch, batch_length')
 if (($close -lt 0) -or ($readActive -lt 0) -or ($postBatch -lt 0) -or ($readActive -gt $close)) {
     throw 'JSON conversion must isolate SD reads until the ready file is closed.'
 }

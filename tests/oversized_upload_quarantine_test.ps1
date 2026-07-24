@@ -5,7 +5,7 @@ $required = @(
     '#define JSON_BATCH_CAPACITY\s+32768U',
     'static uint8_t HTTP_PostReadyFileJson\(const char \*path\)',
     'JSON_BATCH_CAPACITY',
-    'HTTP_PostJsonBatch\(json_batch, batch_length\)',
+    'HTTP_PostJsonBatchWithRetry\(json_batch, batch_length',
     'f_gets\(line, sizeof\(line\), &upload\)',
     'CSV_ROW_PARSE'
 )
