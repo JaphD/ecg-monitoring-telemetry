@@ -17,14 +17,15 @@ foreach ($pattern in $mainPatterns) {
     }
 }
 
-$postStart = $main.IndexOf('static uint8_t HTTP_PostReadyFileJson(const char *path)')
+$postStart = $main.IndexOf('static uint8_t HTTP_PostFile(const char *path)')
 $postEnd = $main.IndexOf('static void Upload_OldestReady(void)', $postStart)
 $post = $main.Substring($postStart, $postEnd - $postStart)
 $close = $post.IndexOf('f_close(&upload)')
 $readActive = $post.IndexOf('sd_upload_read_active = 1U')
-$postBatch = $post.IndexOf('HTTP_PostJsonBatchWithRetry(json_batch, batch_length')
-if (($close -lt 0) -or ($readActive -lt 0) -or ($postBatch -lt 0) -or ($readActive -gt $close)) {
-    throw 'JSON conversion must isolate SD reads until the ready file is closed.'
+$fileRead = $post.IndexOf('f_read(&upload, chunk, sizeof(chunk), &bytes_read)')
+if (($close -lt 0) -or ($readActive -lt 0) -or ($fileRead -lt 0) -or
+    ($readActive -gt $fileRead) -or ($fileRead -gt $close)) {
+    throw 'CSV upload must isolate SD reads until the ready file is closed.'
 }
 
 if ($disk -notmatch 'SD_WaitForTransfer') {
