@@ -47,6 +47,8 @@ static void MX_USART1_UART_Init(void);
 #define ADS_POLL_INTERVAL_MS       4U
 #define MODEM_RAIL_SETTLE_MS       100U
 #define JSON_BATCH_CAPACITY        32768U
+#define MODEM_HTTP_TX_CHUNK_SIZE   512U
+#define MODEM_HTTP_TX_PACING_MS    2U
 #define MODEM_APN                  "internet"
 #define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
 #define ACTIVE_LOG_NAME            "ACTIVE.TMP"
@@ -124,6 +126,9 @@ volatile uint32_t uploads_ok = 0U;
 volatile uint32_t uploads_failed = 0U;
 volatile uint32_t upload_stage = 0U;
 volatile uint32_t upload_bytes_sent = 0U;
+volatile uint32_t upload_uart_chunks = 0U;
+volatile uint32_t upload_uart_last_chunk_size = 0U;
+volatile uint32_t upload_uart_chunk_failures = 0U;
 volatile uint32_t current_http_status = 0U;
 volatile uint32_t sd_unlink_result = 0U;
 volatile uint32_t upload_delete_failures = 0U;
@@ -1104,6 +1109,24 @@ static uint64_t NetworkTime_TimestampForTick(uint32_t sample_tick)
     return network_time_valid ? (uint64_t)((int64_t)network_time_epoch_ms + elapsed_ms) : 0U;
 }
 
+static uint8_t UInt64_ToDecimal(uint64_t value, char *buffer, size_t capacity)
+{
+    char reversed[20];
+    size_t digits = 0U;
+
+    do
+    {
+        reversed[digits++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while ((value != 0U) && (digits < sizeof(reversed)));
+
+    if (capacity <= digits) return 0U;
+    for (size_t i = 0U; i < digits; i++)
+        buffer[i] = reversed[digits - 1U - i];
+    buffer[digits] = '\0';
+    return 1U;
+}
+
 static void ModemPower_Enable(const char *reason)
 {
     modem_power_requested = 1U;
@@ -1164,6 +1187,8 @@ static uint8_t HTTP_PostJsonBatch(const char *payload, uint32_t payload_size)
     uint8_t success = 0U;
     current_http_status = 0U;
     upload_bytes_sent = 0U;
+    upload_uart_chunks = 0U;
+    upload_uart_last_chunk_size = 0U;
     upload_stage = 10U;
     upload_failure_step[0] = '\0';
     upload_failure_response[0] = '\0';
@@ -1200,13 +1225,27 @@ static uint8_t HTTP_PostJsonBatch(const char *payload, uint32_t payload_size)
         goto terminate;
     }
     upload_stage = 30U;
-    if (HAL_UART_Transmit(&huart1, (uint8_t *)payload, (uint16_t)payload_size, 60000U) != HAL_OK)
+    while (upload_bytes_sent < payload_size)
     {
-        Upload_CaptureFailure("DATA_TX");
-        Modem_StopRx();
-        goto terminate;
+        uint32_t chunk_size = payload_size - upload_bytes_sent;
+        if (chunk_size > MODEM_HTTP_TX_CHUNK_SIZE)
+            chunk_size = MODEM_HTTP_TX_CHUNK_SIZE;
+        upload_uart_last_chunk_size = chunk_size;
+        if (HAL_UART_Transmit(&huart1,
+                              (uint8_t *)(payload + upload_bytes_sent),
+                              (uint16_t)chunk_size, 5000U) != HAL_OK)
+        {
+            upload_uart_chunk_failures++;
+            Upload_CaptureFailure("DATA_TX");
+            Modem_StopRx();
+            goto terminate;
+        }
+        upload_bytes_sent += chunk_size;
+        upload_uart_chunks++;
+        Background_Service();
+        if (upload_bytes_sent < payload_size)
+            HAL_Delay(MODEM_HTTP_TX_PACING_MS);
     }
-    upload_bytes_sent = payload_size;
     upload_stage = 40U;
     if (!Modem_Wait("OK", 65000U, 0U))
     {
@@ -1274,15 +1313,22 @@ static uint8_t HTTP_PostReadyFileJson(const char *path)
         int accel_x, accel_y, accel_z;
         long ecg_ch1, ecg_ch2;
         char row[192];
+        char timestamp[21];
         if (sscanf(line, "%lu,%d,%d,%d,%ld,%ld", &tick, &accel_x, &accel_y, &accel_z,
                    &ecg_ch1, &ecg_ch2) != 6)
         {
             Upload_CaptureFailure("CSV_ROW_PARSE");
             goto done;
         }
+        if (!UInt64_ToDecimal(NetworkTime_TimestampForTick((uint32_t)tick),
+                              timestamp, sizeof(timestamp)))
+        {
+            Upload_CaptureFailure("TIMESTAMP_FORMAT");
+            goto done;
+        }
         int row_length = snprintf(row, sizeof(row),
-                                  "{\"timestamp\":%llu,\"accel_x\":%d,\"accel_y\":%d,\"accel_z\":%d,\"ecg_ch1\":%ld,\"ecg_ch2\":%ld}",
-                                  (unsigned long long)NetworkTime_TimestampForTick((uint32_t)tick),
+                                  "{\"timestamp\":%s,\"accel_x\":%d,\"accel_y\":%d,\"accel_z\":%d,\"ecg_ch1\":%ld,\"ecg_ch2\":%ld}",
+                                  timestamp,
                                   accel_x, accel_y, accel_z, ecg_ch1, ecg_ch2);
         if ((row_length <= 0) || ((size_t)row_length >= sizeof(row)))
         {
