@@ -23,8 +23,14 @@ if (($enable -lt 0) -or ($boot -lt 0) -or ($upload -lt 0) -or ($boot -gt $upload
 
 $retryStart = $source.IndexOf('static void Drain_UploadQueueBeforeNextRecord')
 $retryText = $source.Substring($retryStart, 2600)
-if ($retryText -notmatch 'ModemPower_Disable\("upload retry"\)') {
-  throw 'Retry idle must force the modem rail off.'
+if ($source -match 'ModemPower_Disable\("modem boot failed"\)') {
+  throw 'A modem boot failure must retain the enabled modem rail for retry.'
+}
+if ($source -match 'ModemPower_Disable\("upload deferred"\)') {
+  throw 'A deferred upload must retain the enabled modem rail for retry.'
+}
+if ($retryText -match 'ModemPower_Disable\("upload retry"\)') {
+  throw 'Retry idle must retain the enabled modem rail.'
 }
 if ($retryText -notmatch 'UPLOAD_RETRY_IDLE_MS') {
   throw 'Retry cooldown must remain intact.'

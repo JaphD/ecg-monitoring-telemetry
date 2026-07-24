@@ -1111,7 +1111,6 @@ static uint8_t ModemPower_BootForUpload(void)
     modem_power_stage = 20U;
     if (!Modem_Boot())
     {
-        ModemPower_Disable("modem boot failed");
         return 0U;
     }
     modem_power_stage = 30U;
@@ -1614,7 +1613,6 @@ static void Run_UploadPhase(void)
             snprintf((char *)system_status, sizeof(system_status),
                      "Upload deferred; %lu files queued",
                      (unsigned long)sd_files_queued);
-            ModemPower_Disable("upload deferred");
             return;
         }
     }
@@ -1648,7 +1646,6 @@ static void Drain_UploadQueueBeforeNextRecord(void)
                  (unsigned long)sd_files_queued);
 
         uint32_t start = HAL_GetTick();
-        ModemPower_Disable("upload retry");
         while ((HAL_GetTick() - start) < UPLOAD_RETRY_IDLE_MS)
         {
             LIS3DH_Service();
