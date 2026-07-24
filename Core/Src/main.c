@@ -128,6 +128,9 @@ volatile uint32_t upload_uart_chunks = 0U;
 volatile uint32_t upload_uart_last_chunk_size = 0U;
 volatile uint32_t upload_uart_chunk_failures = 0U;
 volatile uint32_t current_http_status = 0U;
+volatile uint32_t tls_handshake_failures = 0U;
+volatile uint32_t tls_recovery_pending = 0U;
+volatile uint32_t tls_recovery_cycles = 0U;
 volatile uint32_t sd_unlink_result = 0U;
 volatile uint32_t upload_delete_failures = 0U;
 volatile uint32_t upload_oversize_files = 0U;
@@ -1182,6 +1185,24 @@ static uint8_t HTTP_PostFile(const char *path)
         Upload_CaptureFailure("HTTPINIT");
         goto done;
     }
+    if (!Modem_Command("AT+CSSLCFG=\"sslversion\",0,3\r\n",
+                       "OK", 3000U, 0U))
+    {
+        Upload_CaptureFailure("TLS_VERSION");
+        goto terminate;
+    }
+    if (!Modem_Command("AT+CSSLCFG=\"enableSNI\",0,1\r\n",
+                       "OK", 3000U, 0U))
+    {
+        Upload_CaptureFailure("TLS_SNI");
+        goto terminate;
+    }
+    if (!Modem_Command("AT+HTTPPARA=\"SSLCFG\",0\r\n",
+                       "OK", 3000U, 0U))
+    {
+        Upload_CaptureFailure("TLS_CONTEXT");
+        goto terminate;
+    }
     snprintf(command, sizeof(command), "AT+HTTPPARA=\"URL\",\"%s\"\r\n", UPLOAD_URL);
     if (!Modem_Command(command, "OK", 5000U, 0U))
     {
@@ -1278,6 +1299,7 @@ static uint8_t HTTP_PostFile(const char *path)
         {
             current_http_status = (uint32_t)status;
             last_http_status = current_http_status;
+            if (current_http_status == 715U) tls_handshake_failures++;
             success = (status == 200U) ? 1U : 0U;
             if (success) upload_stage = 70U;
             else Upload_CaptureFailure("HTTP_STATUS");
@@ -1346,6 +1368,7 @@ static void Upload_OldestReady(void)
     snprintf((char *)current_upload_filename, sizeof(current_upload_filename), "%s", path);
     upload_in_progress = 1U;
     uint8_t uploaded = 0U;
+    uint8_t saw_tls_715 = 0U;
 
     for (uint32_t attempt = 1U; attempt <= HTTP_MAX_ATTEMPTS; attempt++)
     {
@@ -1365,6 +1388,7 @@ static void Upload_OldestReady(void)
             uploaded = 1U;
             break;
         }
+        if (current_http_status == 715U) saw_tls_715 = 1U;
         if (attempt < HTTP_MAX_ATTEMPTS)
         {
             uint32_t start = HAL_GetTick();
@@ -1375,7 +1399,11 @@ static void Upload_OldestReady(void)
             }
         }
     }
-    if (!uploaded) uploads_failed++;
+    if (!uploaded)
+    {
+        uploads_failed++;
+        if (saw_tls_715) tls_recovery_pending = 1U;
+    }
     upload_in_progress = 0U;
     current_upload_filename[0] = '\0';
 
@@ -1638,6 +1666,16 @@ static void Drain_UploadQueueBeforeNextRecord(void)
         if (sd_files_queued == 0U)
         {
             return;
+        }
+
+        if (tls_recovery_pending != 0U)
+        {
+            tls_recovery_cycles++;
+            snprintf((char *)system_status, sizeof(system_status),
+                     "TLS 715 recovery; %lu files queued",
+                     (unsigned long)sd_files_queued);
+            ModemPower_Disable("TLS 715 recovery");
+            tls_recovery_pending = 0U;
         }
 
         system_phase = 50U;
