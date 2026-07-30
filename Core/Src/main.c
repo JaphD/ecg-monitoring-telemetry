@@ -6,6 +6,7 @@
   */
 
 #include "main.h"
+#include "ads_sync_capture.h"
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -198,6 +199,19 @@ volatile int32_t ads_external_ch2_buffer_mean = 0;
 volatile int32_t ads_external_ch2_buffer_pp = 0;
 volatile int32_t ads_external_ch1_buffer[ADS_BUFFER_LENGTH] = {0};
 volatile int32_t ads_external_ch2_buffer[ADS_BUFFER_LENGTH] = {0};
+
+/* Synchronized bench-replay capture: marker -> quiet -> one frozen CH2 frame. */
+volatile uint32_t ads_sync_detected = 0U;
+volatile uint32_t ads_capture_active = 0U;
+volatile uint32_t ads_capture_frozen = 0U;
+volatile uint32_t ads_capture_count = 0U;
+volatile uint32_t ads_capture_sequence = 0U;
+volatile uint32_t ads_sync_marker_phase = 0U;
+volatile uint32_t ads_sync_marker_samples = 0U;
+volatile uint32_t ads_sync_quiet_count = 0U;
+volatile int32_t ads_sync_baseline = 0;
+volatile int32_t ads_capture_ch2[ADS_SYNC_CAPTURE_LENGTH] = {0};
+static ADS_SyncCapture ads_sync_capture;
 
 static uint32_t ads_previous_drdy_cycles = 0U;
 
@@ -796,6 +810,7 @@ static bool ADS_ExternalSetup(void)
             ADS_Fail(ADS_FAILURE_SPI, "External setup failed");
         return false;
     }
+    ADS_SyncCapture_Init(&ads_sync_capture, ads_capture_ch2);
     ads_external_active = 1U;
     ads_test_result = ADS_RESULT_CAPTURE_ACTIVE;
     return true;
@@ -820,6 +835,23 @@ static void ADS_ExternalCapture(void)
         ch2 = ADS_SignExtend24(&frame[6]);
         ads_external_ch1_latest = ch1;
         ads_external_ch2_latest = ch2;
+        if (ads_capture_frozen == 0U)
+        {
+            bool capture_just_froze = ADS_SyncCapture_Push(&ads_sync_capture, ch2);
+            ads_sync_detected = ads_sync_capture.sync_detected ? 1U : 0U;
+            ads_capture_active = ads_sync_capture.capture_active ? 1U : 0U;
+            ads_capture_frozen = ads_sync_capture.capture_frozen ? 1U : 0U;
+            ads_capture_count = ads_sync_capture.capture_count;
+            ads_sync_marker_phase = ads_sync_capture.marker_phase;
+            ads_sync_marker_samples = ads_sync_capture.marker_plateau_count;
+            ads_sync_quiet_count = ads_sync_capture.quiet_count;
+            ads_sync_baseline = ads_sync_capture.baseline;
+            if (capture_just_froze)
+            {
+                /* Assign last: a changed sequence marks one coherent frame. */
+                ads_capture_sequence++;
+            }
+        }
         if (ch1 < ads_external_ch1_min) ads_external_ch1_min = ch1;
         if (ch1 > ads_external_ch1_max) ads_external_ch1_max = ch1;
         if (ch2 < ads_external_ch2_min) ads_external_ch2_min = ch2;
