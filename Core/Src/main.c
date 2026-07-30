@@ -206,6 +206,9 @@ volatile uint32_t ads_capture_active = 0U;
 volatile uint32_t ads_capture_frozen = 0U;
 volatile uint32_t ads_capture_count = 0U;
 volatile uint32_t ads_capture_sequence = 0U;
+/* 2,500 signed 32-bit samples: export 10,000 bytes after capture freezes. */
+volatile uint32_t ads_capture_export_bytes =
+    ADS_SYNC_CAPTURE_LENGTH * (uint32_t)sizeof(int32_t);
 volatile uint32_t ads_sync_marker_phase = 0U;
 volatile uint32_t ads_sync_marker_samples = 0U;
 volatile uint32_t ads_sync_quiet_count = 0U;

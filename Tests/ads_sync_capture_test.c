@@ -10,14 +10,21 @@ int main(void)
     int32_t buffer[ADS_SYNC_CAPTURE_LENGTH] = {0};
     uint32_t i;
 
+    assert(ADS_SYNC_CAPTURE_LENGTH == 2500U);
+    assert(ADS_SYNC_MARKER_PLATEAU_SAMPLES == 8U);
+
     ADS_SyncCapture_Init(&capture, buffer);
     for (i = 0U; i < 64U; i++)
         ADS_SyncCapture_Push(&capture, 120000);
 
-    for (i = 0U; i < 4U; i++) ADS_SyncCapture_Push(&capture, 125000);
-    for (i = 0U; i < 4U; i++) ADS_SyncCapture_Push(&capture, 115000);
-    for (i = 0U; i < 4U; i++) ADS_SyncCapture_Push(&capture, 125000);
-    for (i = 0U; i < 4U; i++) ADS_SyncCapture_Push(&capture, 115000);
+    for (i = 0U; i < ADS_SYNC_MARKER_PLATEAU_SAMPLES; i++)
+        ADS_SyncCapture_Push(&capture, 125000);
+    for (i = 0U; i < ADS_SYNC_MARKER_PLATEAU_SAMPLES; i++)
+        ADS_SyncCapture_Push(&capture, 115000);
+    for (i = 0U; i < ADS_SYNC_MARKER_PLATEAU_SAMPLES; i++)
+        ADS_SyncCapture_Push(&capture, 125000);
+    for (i = 0U; i < ADS_SYNC_MARKER_PLATEAU_SAMPLES; i++)
+        ADS_SyncCapture_Push(&capture, 115000);
     assert(capture.sync_detected);
 
     for (i = 0U; i < ADS_SYNC_QUIET_SAMPLES; i++)
