@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 I2C_HandleTypeDef  hi2c1;
 SD_HandleTypeDef   hsd1;
@@ -39,14 +40,44 @@ static void MX_USART1_UART_Init(void);
 #define ADS_START_RECOVERY_MS      5000U
 #define ADS_START_MAX_ATTEMPTS     3U
 #define ADS_RESTART_QUIET_MS       250U
-#define ADS_ID_READ_MAX_ATTEMPTS   5U
-#define ADS_ID_READ_RETRY_MS       75U
 #define ADS_START_DRDY_TIMEOUT_MS  200U
+#define ADS_DRDY_TIMEOUT_MS        100U
+#define ADS_SETTLING_FRAMES        4U
+#define ADS_REGISTER_VERIFY_RETRIES 3U
+#define ADS_SPI_GUARD_MS           2U
+#define ADS_COMMAND_MODE_RETRIES   2U
+#define ADS_CMD_START              0x08U
+#define ADS_CMD_STOP               0x0AU
+#define ADS_CMD_RDATAC             0x10U
+#define ADS_CMD_SDATAC             0x11U
+#define ADS_REG_ID                 0x00U
+#define ADS_REG_CONFIG1            0x01U
+#define ADS_REG_CONFIG2            0x02U
+#define ADS_REG_LOFF               0x03U
+#define ADS_REG_CH1SET             0x04U
+#define ADS_REG_CH2SET             0x05U
+#define ADS_REG_RLD_SENS           0x06U
+#define ADS_REG_LOFF_SENS          0x07U
+#define ADS_REG_RESP1              0x09U
+#define ADS_REG_RESP2              0x0AU
+#define ADS_ID_EXPECTED            0x73U
 #define ADS_CONFIG1_250_SPS        0x01U
-#define ADS_DRDY_FALLBACK_MS       40U
+#define ADS_CONFIG2_EXTERNAL       0xE0U
+#define ADS_LOFF_MAIN              0x10U
+#define ADS_CH2SET_NORMAL          0x00U
+#define ADS_RLD_SENS_MAIN          0x2CU
+#define ADS_LOFF_SENS_MAIN         0x0FU
+#define ADS_RESP1_MAIN             0xEAU
+#define ADS_RESP2_MAIN             0x03U
+#define ADS_DRDY_PORT              GPIOA
+#define ADS_DRDY_PIN               GPIO_PIN_0
+#define ADS_CH1SET_INTERNAL_SHORT  0x11U
+#define ADS_STREAM_RATE_SAMPLES    250U
+#define ADS_STREAM_STATS_SAMPLES   500U
 #define ADS_POLL_INTERVAL_MS       4U
 #define MAX_HTTPDATA_BYTES         100000U
 #define MODEM_APN                  "internet"
+#define MODEM_RX_DRAIN_MAX_BYTES   64U
 #define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
 #define ACTIVE_LOG_NAME            "ACTIVE.TMP"
 #define CSV_HEADER                 "timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n"
@@ -78,6 +109,15 @@ static volatile uint8_t upload_in_progress = 0U;
 static volatile uint8_t sd_upload_read_active = 0U;
 static uint32_t last_imu_tick = 0U;
 static uint32_t ads_last_poll_tick = 0U;
+static uint16_t ads_rate_window_count = 0U;
+static uint32_t ads_rate_window_start_tick = 0U;
+static uint16_t ads_stream_stats_count = 0U;
+static int64_t ads_stream_ch1_sum = 0;
+static int64_t ads_stream_ch2_sum = 0;
+static int32_t ads_stream_ch1_window_min = INT32_MAX;
+static int32_t ads_stream_ch1_window_max = INT32_MIN;
+static int32_t ads_stream_ch2_window_min = INT32_MAX;
+static int32_t ads_stream_ch2_window_max = INT32_MIN;
 
 static volatile char modem_rx[512];
 static volatile uint16_t modem_rx_len = 0U;
@@ -132,8 +172,25 @@ volatile uint32_t last_upload_attempts = 0U;
 volatile uint32_t last_upload_file_size = 0U;
 volatile uint32_t uart_error_flags = 0U;
 volatile uint32_t uart_overruns = 0U;
+volatile uint32_t modem_rx_drain_bytes = 0U;
+volatile uint32_t modem_rx_drain_limit_hits = 0U;
 volatile uint32_t ads_drdy_irq_count = 0U;
 volatile uint32_t ads_spi_errors = 0U;
+volatile uint32_t ads_frame_error_count = 0U;
+volatile uint32_t ads_invalid_frame_drops = 0U;
+volatile uint32_t ads_drdy_release_timeouts = 0U;
+volatile uint32_t ads_last_status_word = 0U;
+volatile uint8_t ads_last_raw_frame[9] = {0};
+volatile uint32_t ads_measured_rate_millihz = 0U;
+volatile uint32_t ads_stream_stats_sequence = 0U;
+volatile int32_t ads_stream_ch1_min = 0;
+volatile int32_t ads_stream_ch1_max = 0;
+volatile int32_t ads_stream_ch1_mean = 0;
+volatile int32_t ads_stream_ch1_pp = 0;
+volatile int32_t ads_stream_ch2_min = 0;
+volatile int32_t ads_stream_ch2_max = 0;
+volatile int32_t ads_stream_ch2_mean = 0;
+volatile int32_t ads_stream_ch2_pp = 0;
 volatile uint32_t ads_id_value = 0U;
 volatile uint32_t ads_config1_readback = 0U;
 volatile uint32_t ads_stream_stage = 0U;
@@ -152,6 +209,18 @@ volatile uint32_t ads_start_successes = 0U;
 volatile uint32_t ads_start_id_failures = 0U;
 volatile uint32_t ads_start_config_failures = 0U;
 volatile uint32_t ads_start_drdy_failures = 0U;
+volatile uint32_t ads_command_mode_attempts = 0U;
+volatile uint32_t ads_command_mode_retries = 0U;
+volatile uint32_t ads_command_mode_recoveries = 0U;
+volatile uint32_t ads_command_mode_failures = 0U;
+volatile uint32_t ads_command_mode_last_id = 0U;
+volatile uint32_t ads_register_mismatch_mask = 0U;
+volatile uint32_t ads_register_verify_retry_count = 0U;
+volatile uint32_t ads_last_verify_register = 0U;
+volatile uint32_t ads_last_verify_expected = 0U;
+volatile uint32_t ads_last_verify_readback = 0U;
+volatile uint32_t ads_config2_mismatch_count = 0U;
+volatile uint32_t ads_settling_frames_read = 0U;
 volatile uint32_t modem_boot_stage = 0U;
 volatile char last_modem_response[512] = {0};
 volatile char modem_boot_failure[64] = {0};
@@ -164,14 +233,104 @@ volatile char current_log_filename[32] = {0};
 volatile char current_upload_filename[32] = {0};
 
 static void Background_Service(void);
-static void ADS_CaptureFromISR(void);
+static uint8_t ADS_CaptureFrame(void);
 static void ADS_Service(void);
+static uint8_t ADS_WaitForDrdyState(GPIO_PinState state, uint32_t timeout_ms);
 static void LIS3DH_Service(void);
 static void Logger_RecoverQueue(void);
 static FRESULT Logger_SyncActiveFile(void);
 static void Handle_ADSStartFailure(void);
 static void Handle_SDRecordStall(void);
 static void Run_SDRecoveryIfNeeded(void);
+
+static void ADS_ResetStreamDiagnostics(void)
+{
+    ads_rate_window_count = 0U;
+    ads_rate_window_start_tick = 0U;
+    ads_stream_stats_count = 0U;
+    ads_stream_ch1_sum = 0;
+    ads_stream_ch2_sum = 0;
+    ads_stream_ch1_window_min = INT32_MAX;
+    ads_stream_ch1_window_max = INT32_MIN;
+    ads_stream_ch2_window_min = INT32_MAX;
+    ads_stream_ch2_window_max = INT32_MIN;
+
+    ads_frame_error_count = 0U;
+    ads_invalid_frame_drops = 0U;
+    ads_drdy_release_timeouts = 0U;
+    ads_last_status_word = 0U;
+    memset((void *)ads_last_raw_frame, 0, sizeof(ads_last_raw_frame));
+    ads_measured_rate_millihz = 0U;
+    ads_stream_stats_sequence = 0U;
+    ads_stream_ch1_min = 0;
+    ads_stream_ch1_max = 0;
+    ads_stream_ch1_mean = 0;
+    ads_stream_ch1_pp = 0;
+    ads_stream_ch2_min = 0;
+    ads_stream_ch2_max = 0;
+    ads_stream_ch2_mean = 0;
+    ads_stream_ch2_pp = 0;
+}
+
+static void ADS_UpdateStreamDiagnostics(const uint8_t frame[9], int32_t ch1, int32_t ch2)
+{
+    uint32_t now = HAL_GetTick();
+    ads_last_status_word = ((uint32_t)frame[0] << 16) |
+                           ((uint32_t)frame[1] << 8) |
+                           (uint32_t)frame[2];
+    if ((ads_last_status_word & 0xF00000UL) != 0xC00000UL)
+    {
+        ads_frame_error_count++;
+    }
+
+    if (ads_rate_window_count == 0U)
+    {
+        ads_rate_window_start_tick = now;
+    }
+    ads_rate_window_count++;
+    if (ads_rate_window_count >= ADS_STREAM_RATE_SAMPLES)
+    {
+        uint32_t elapsed_ms = now - ads_rate_window_start_tick;
+        if (elapsed_ms > 0U)
+        {
+            ads_measured_rate_millihz =
+                (uint32_t)(((uint64_t)(ADS_STREAM_RATE_SAMPLES - 1U) * 1000000ULL) /
+                           elapsed_ms);
+        }
+        ads_rate_window_count = 0U;
+    }
+
+    if (ads_stream_stats_count == 0U)
+    {
+        ads_stream_ch1_sum = 0;
+        ads_stream_ch2_sum = 0;
+        ads_stream_ch1_window_min = INT32_MAX;
+        ads_stream_ch1_window_max = INT32_MIN;
+        ads_stream_ch2_window_min = INT32_MAX;
+        ads_stream_ch2_window_max = INT32_MIN;
+    }
+    if (ch1 < ads_stream_ch1_window_min) ads_stream_ch1_window_min = ch1;
+    if (ch1 > ads_stream_ch1_window_max) ads_stream_ch1_window_max = ch1;
+    if (ch2 < ads_stream_ch2_window_min) ads_stream_ch2_window_min = ch2;
+    if (ch2 > ads_stream_ch2_window_max) ads_stream_ch2_window_max = ch2;
+    ads_stream_ch1_sum += ch1;
+    ads_stream_ch2_sum += ch2;
+    ads_stream_stats_count++;
+
+    if (ads_stream_stats_count >= ADS_STREAM_STATS_SAMPLES)
+    {
+        ads_stream_ch1_min = ads_stream_ch1_window_min;
+        ads_stream_ch1_max = ads_stream_ch1_window_max;
+        ads_stream_ch1_mean = (int32_t)(ads_stream_ch1_sum / (int64_t)ADS_STREAM_STATS_SAMPLES);
+        ads_stream_ch1_pp = ads_stream_ch1_window_max - ads_stream_ch1_window_min;
+        ads_stream_ch2_min = ads_stream_ch2_window_min;
+        ads_stream_ch2_max = ads_stream_ch2_window_max;
+        ads_stream_ch2_mean = (int32_t)(ads_stream_ch2_sum / (int64_t)ADS_STREAM_STATS_SAMPLES);
+        ads_stream_ch2_pp = ads_stream_ch2_window_max - ads_stream_ch2_window_min;
+        ads_stream_stats_sequence++;
+        ads_stream_stats_count = 0U;
+    }
+}
 
 static uint8_t IsReadyFileName(const char *name)
 {
@@ -193,70 +352,224 @@ static inline void ADS_CS(uint8_t active)
                       active ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
-static void ADS_Command(uint8_t command)
+static HAL_StatusTypeDef ADS_Command(uint8_t command)
 {
+    HAL_StatusTypeDef result;
     ADS_CS(1U);
-    (void)HAL_SPI_Transmit(&hspi1, &command, 1U, 20U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    result = HAL_SPI_Transmit(&hspi1, &command, 1U, 20U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
     ADS_CS(0U);
-    HAL_Delay(2U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    if (result != HAL_OK) ads_spi_errors++;
+    return result;
 }
 
-static void ADS_WriteReg(uint8_t reg, uint8_t value)
+static HAL_StatusTypeDef ADS_WriteRegister(uint8_t address, uint8_t value)
 {
-    uint8_t bytes[3] = {(uint8_t)(0x40U | (reg & 0x1FU)), 0U, value};
+    uint8_t tx[3] = {(uint8_t)(0x40U | (address & 0x1FU)), 0U, value};
+    HAL_StatusTypeDef result = HAL_OK;
+
     ADS_CS(1U);
-    (void)HAL_SPI_Transmit(&hspi1, bytes, sizeof(bytes), 20U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    for (uint32_t i = 0U; (i < sizeof(tx)) && (result == HAL_OK); i++)
+    {
+        result = HAL_SPI_Transmit(&hspi1, &tx[i], 1U, 20U);
+        HAL_Delay(ADS_SPI_GUARD_MS);
+    }
     ADS_CS(0U);
-    HAL_Delay(2U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    if (result != HAL_OK) ads_spi_errors++;
+    return result;
 }
 
-static uint8_t ADS_ReadReg(uint8_t reg)
+static HAL_StatusTypeDef ADS_ReadRegister(uint8_t address, uint8_t *value)
 {
-    uint8_t command[2] = {(uint8_t)(0x20U | (reg & 0x1FU)), 0U};
-    uint8_t tx = 0U, value = 0U;
+    uint8_t header[2] = {(uint8_t)(0x20U | (address & 0x1FU)), 0U};
+    uint8_t dummy = 0U;
+    HAL_StatusTypeDef result;
+
     ADS_CS(1U);
-    (void)HAL_SPI_Transmit(&hspi1, command, 2U, 20U);
-    (void)HAL_SPI_TransmitReceive(&hspi1, &tx, &value, 1U, 20U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    result = HAL_SPI_Transmit(&hspi1, &header[0], 1U, 20U);
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    if (result == HAL_OK)
+    {
+        result = HAL_SPI_Transmit(&hspi1, &header[1], 1U, 20U);
+        HAL_Delay(ADS_SPI_GUARD_MS);
+    }
+    if (result == HAL_OK)
+    {
+        result = HAL_SPI_TransmitReceive(&hspi1, &dummy, value, 1U, 20U);
+        HAL_Delay(ADS_SPI_GUARD_MS);
+    }
     ADS_CS(0U);
-    return value;
+    HAL_Delay(ADS_SPI_GUARD_MS);
+    if (result != HAL_OK) ads_spi_errors++;
+    return result;
+}
+
+static HAL_StatusTypeDef ADS_ReadFrame(uint8_t frame[9])
+{
+    uint8_t tx[9] = {0};
+    HAL_StatusTypeDef result;
+
+    ADS_CS(1U);
+    result = HAL_SPI_TransmitReceive(&hspi1, tx, frame, 9U, 20U);
+    ADS_CS(0U);
+    if (result != HAL_OK) ads_spi_errors++;
+    return result;
+}
+
+static void ADS_HardwareReset(void)
+{
+    ADS_CS(0U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(10U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(100U);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(200U);
+}
+
+static uint8_t ADS_CommandModeProbe(void)
+{
+    uint8_t id = 0U;
+    if (ADS_ReadRegister(ADS_REG_ID, &id) != HAL_OK) return 0U;
+    ads_command_mode_last_id = id;
+    ads_id_value = id;
+    return id == ADS_ID_EXPECTED;
+}
+
+static HAL_StatusTypeDef ADS_EnterCommandMode(void)
+{
+    ads_command_mode_attempts++;
+    for (uint32_t attempt = 0U; attempt < ADS_COMMAND_MODE_RETRIES; attempt++)
+    {
+        if (attempt > 0U) ads_command_mode_retries++;
+        if (ADS_Command(ADS_CMD_SDATAC) != HAL_OK) return HAL_ERROR;
+        HAL_Delay(20U);
+        if (ADS_CommandModeProbe())
+        {
+            if (ADS_Command(ADS_CMD_STOP) != HAL_OK) return HAL_ERROR;
+            HAL_Delay(20U);
+            if (ADS_CommandModeProbe()) return HAL_OK;
+        }
+    }
+
+    ads_command_mode_recoveries++;
+    ADS_HardwareReset();
+    if (ADS_Command(ADS_CMD_SDATAC) == HAL_OK)
+    {
+        HAL_Delay(100U);
+        if (ADS_CommandModeProbe())
+        {
+            if (ADS_Command(ADS_CMD_STOP) != HAL_OK) return HAL_ERROR;
+            HAL_Delay(20U);
+            if (ADS_CommandModeProbe()) return HAL_OK;
+        }
+    }
+
+    ads_command_mode_failures++;
+    return HAL_ERROR;
+}
+
+static HAL_StatusTypeDef ADS_WriteAndVerify(uint8_t address, uint8_t value)
+{
+    uint8_t readback = 0U;
+
+    for (uint32_t attempt = 0U; attempt < ADS_REGISTER_VERIFY_RETRIES; attempt++)
+    {
+        if (ADS_WriteRegister(address, value) != HAL_OK) return HAL_ERROR;
+        HAL_Delay(4U);
+        if (ADS_ReadRegister(address, &readback) != HAL_OK) return HAL_ERROR;
+
+        ads_last_verify_register = address;
+        ads_last_verify_expected = value;
+        ads_last_verify_readback = readback;
+        if (address == ADS_REG_CONFIG1) ads_config1_readback = readback;
+        if (readback == value)
+        {
+            if (attempt > 0U) ads_register_verify_retry_count += attempt;
+            return HAL_OK;
+        }
+        HAL_Delay(4U);
+    }
+
+    ads_register_mismatch_mask |= (1UL << address);
+    return HAL_ERROR;
+}
+
+static HAL_StatusTypeDef ADS_WriteConfig2Lenient(uint8_t value)
+{
+    uint8_t readback = 0U;
+
+    for (uint32_t attempt = 0U; attempt < ADS_REGISTER_VERIFY_RETRIES; attempt++)
+    {
+        if (ADS_WriteRegister(ADS_REG_CONFIG2, value) != HAL_OK) return HAL_ERROR;
+        HAL_Delay(4U);
+        if (ADS_ReadRegister(ADS_REG_CONFIG2, &readback) != HAL_OK) return HAL_ERROR;
+
+        ads_last_verify_register = ADS_REG_CONFIG2;
+        ads_last_verify_expected = value;
+        ads_last_verify_readback = readback;
+        if (readback == value)
+        {
+            if (attempt > 0U) ads_register_verify_retry_count += attempt;
+            return HAL_OK;
+        }
+        HAL_Delay(4U);
+    }
+
+    /* This board's validated branch treats CONFIG2 readback mismatch as
+     * diagnostic evidence while allowing conversion evidence to decide. */
+    ads_register_mismatch_mask |= (1UL << ADS_REG_CONFIG2);
+    ads_config2_mismatch_count++;
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef ADS_StartContinuous(void)
+{
+    uint8_t frame[9];
+
+    if (ADS_Command(ADS_CMD_START) != HAL_OK) return HAL_ERROR;
+    HAL_Delay(10U);
+    if (ADS_Command(ADS_CMD_RDATAC) != HAL_OK) return HAL_ERROR;
+    HAL_Delay(10U);
+
+    ads_settling_frames_read = 0U;
+    for (uint32_t i = 0U; i < ADS_SETTLING_FRAMES; i++)
+    {
+        if (!ADS_WaitForDrdyState(GPIO_PIN_RESET, ADS_DRDY_TIMEOUT_MS))
+            return HAL_ERROR;
+        if (ADS_ReadFrame(frame) != HAL_OK) return HAL_ERROR;
+        memcpy((void *)ads_last_raw_frame, frame, sizeof(ads_last_raw_frame));
+        ads_last_status_word = ((uint32_t)frame[0] << 16) |
+                               ((uint32_t)frame[1] << 8) |
+                               (uint32_t)frame[2];
+        if ((ads_last_status_word & 0xF00000UL) != 0xC00000UL)
+            ads_frame_error_count++;
+        if (!ADS_WaitForDrdyState(GPIO_PIN_SET, 2U))
+        {
+            ads_drdy_release_timeouts++;
+            return HAL_ERROR;
+        }
+        ads_settling_frames_read++;
+    }
+    return HAL_OK;
 }
 
 static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
 {
+    ADS_ResetStreamDiagnostics();
+    ads_register_mismatch_mask = 0U;
+    ads_settling_frames_read = 0U;
     ads_stream_stage = 1U;
     ads_capture_mode = 0U;
     acquisition_enabled = 0U;
-    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-    ADS_CS(0U);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_Delay(10U);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(2000U);
 
-    /* Full hardware-reset sequence validated by b3feab2/f2a0433. This is
-     * required when RESET/PWDN has remained low throughout a boot upload. */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(100U);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
-    HAL_Delay(100U);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
-    HAL_Delay(200U);
-
-    ADS_Command(0x11U); /* SDATAC */
-    HAL_Delay(200U);
-    ads_id_value = 0U;
-    for (uint32_t id_attempt = 1U; id_attempt <= ADS_ID_READ_MAX_ATTEMPTS; id_attempt++)
-    {
-        ads_id_value = ADS_ReadReg(0x00U);
-        if ((ads_id_value & 0x7FU) == 0x73U) break;
-        if (id_attempt < ADS_ID_READ_MAX_ATTEMPTS)
-        {
-            HAL_Delay(ADS_ID_READ_RETRY_MS);
-            ADS_Command(0x11U); /* SDATAC */
-            HAL_Delay(20U);
-        }
-    }
-    if ((ads_id_value & 0x7FU) != 0x73U)
+    ADS_HardwareReset();
+    if (ADS_EnterCommandMode() != HAL_OK)
     {
         ads_start_id_failures++;
         ads_stream_stage = 255U;
@@ -264,17 +577,17 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
     }
     ads_stream_stage = 5U;
 
-    ADS_WriteReg(0x01U, ADS_CONFIG1_250_SPS); /* 250 SPS */
-    ADS_WriteReg(0x02U, 0xE0U);
-    ADS_WriteReg(0x03U, 0x10U);
-    ADS_WriteReg(0x04U, 0x00U);
-    ADS_WriteReg(0x05U, 0x00U);
-    ADS_WriteReg(0x06U, 0x2CU);
-    ADS_WriteReg(0x07U, 0x0FU);
-    ADS_WriteReg(0x09U, 0xEAU);
-    ADS_WriteReg(0x0AU, 0x03U);
-    ads_config1_readback = ADS_ReadReg(0x01U);
-    if (ads_config1_readback != ADS_CONFIG1_250_SPS)
+    /* Bench-validated routing: CH1 is the internal-short reference and
+     * CH2 receives the attenuated/bias-shifted RA/LA differential signal. */
+    if ((ADS_WriteAndVerify(ADS_REG_CONFIG1, ADS_CONFIG1_250_SPS) != HAL_OK) ||
+        (ADS_WriteConfig2Lenient(ADS_CONFIG2_EXTERNAL) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_LOFF, ADS_LOFF_MAIN) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_CH1SET, ADS_CH1SET_INTERNAL_SHORT) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_CH2SET, ADS_CH2SET_NORMAL) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_RLD_SENS, ADS_RLD_SENS_MAIN) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_LOFF_SENS, ADS_LOFF_SENS_MAIN) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_RESP1, ADS_RESP1_MAIN) != HAL_OK) ||
+        (ADS_WriteAndVerify(ADS_REG_RESP2, ADS_RESP2_MAIN) != HAL_OK))
     {
         ads_start_config_failures++;
         ads_stream_stage = 255U;
@@ -282,32 +595,20 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
     }
     ads_stream_stage = 10U;
 
-    /* Use the sequence proven on this board in b3feab2/f2a0433: start the
-     * converter first, then enter continuous-read mode.  Sending START after
-     * RDATAC left the device responsive to register reads but produced no
-     * DRDY frames. */
-    ADS_Command(0x08U); /* START */
-    HAL_Delay(10U);
-    ADS_Command(0x10U); /* RDATAC */
-    HAL_Delay(10U);
+    if (ADS_StartContinuous() != HAL_OK)
+    {
+        ads_start_drdy_failures++;
+        ads_stream_stage = 255U;
+        return HAL_ERROR;
+    }
     ads_stream_stage = 20U;
 
-    /* PB9 may already be LOW by the time EXTI is armed. Drain that frame once
-     * to release DRDY, then enable falling-edge interrupts for every following
-     * conversion. */
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
-    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5U, 0U);
-    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
-    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_RESET)
-    {
-        ADS_CaptureFromISR();
-        ads_bootstrap_capture_count++;
-    }
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
+    /* The validated board wiring routes ADS1292R DRDY# to PA0.  Polling this
+     * pin is intentional: PB9 is an unrelated board interrupt source. */
+    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN);
     acquisition_enabled = 1U;
-    ads_last_irq_tick = HAL_GetTick();
-    ads_capture_mode = 1U;
-    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+    ads_last_poll_tick = HAL_GetTick();
+    ads_capture_mode = 2U; /* PA0 polling */
     ads_has_started = 1U;
 
     uint16_t start_head = ring_head;
@@ -325,7 +626,6 @@ static HAL_StatusTypeDef ADS_ConfigureAndStartAttempt(void)
         ads_stream_stage = 255U;
         acquisition_enabled = 0U;
         ads_capture_mode = 0U;
-        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
         return HAL_ERROR;
     }
 
@@ -356,7 +656,6 @@ static HAL_StatusTypeDef ADS_StartAcquisition(void)
         ads_start_failures++;
         acquisition_enabled = 0U;
         ads_has_started = 0U;
-        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
         ADS_CS(0U);
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
         HAL_Delay(500U);
@@ -368,25 +667,56 @@ static void ADS_StopAcquisition(void)
 {
     acquisition_enabled = 0U;
     ads_capture_mode = 0U;
-    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
     if (!ads_has_started) return;
-    ADS_Command(0x11U); /* SDATAC */
-    ADS_Command(0x0AU); /* STOP */
+    (void)ADS_EnterCommandMode();
     ads_has_started = 0U;
 }
 
-static void ADS_CaptureFromISR(void)
+static uint8_t ADS_WaitForDrdyState(GPIO_PinState state, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN) != state)
+    {
+        if ((HAL_GetTick() - start) >= timeout_ms)
+        {
+            ads_drdy_pin_state =
+                (uint32_t)HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN);
+            return 0U;
+        }
+    }
+    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN);
+    return 1U;
+}
+
+static uint8_t ADS_CaptureFrame(void)
 {
     uint8_t tx[9] = {0};
     uint8_t rx[9] = {0};
+    if (!ADS_WaitForDrdyState(GPIO_PIN_RESET, 0U)) return 0U;
+
     ADS_CS(1U);
     HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 9U, 2U);
     ADS_CS(0U);
     if (status != HAL_OK)
     {
         ads_spi_errors++;
-        return;
+        return 0U;
+    }
+
+    memcpy((void *)ads_last_raw_frame, rx, sizeof(ads_last_raw_frame));
+    ads_last_status_word = ((uint32_t)rx[0] << 16) |
+                           ((uint32_t)rx[1] << 8) |
+                           (uint32_t)rx[2];
+    if (!ADS_WaitForDrdyState(GPIO_PIN_SET, 2U))
+    {
+        ads_drdy_release_timeouts++;
+        return 0U;
+    }
+    if ((ads_last_status_word & 0xF00000UL) != 0xC00000UL)
+    {
+        ads_frame_error_count++;
+        ads_invalid_frame_drops++;
+        return 0U;
     }
 
     int32_t ch1 = ((int32_t)rx[3] << 16) | ((int32_t)rx[4] << 8) | rx[5];
@@ -394,12 +724,14 @@ static void ADS_CaptureFromISR(void)
     if ((ch1 & 0x00800000L) != 0) ch1 |= (int32_t)0xFF000000L;
     if ((ch2 & 0x00800000L) != 0) ch2 |= (int32_t)0xFF000000L;
 
+    ADS_UpdateStreamDiagnostics(rx, ch1, ch2);
+
     uint16_t head = ring_head;
     uint16_t next = (uint16_t)((head + 1U) & SAMPLE_RING_MASK);
     if (next == ring_tail)
     {
         sample_ring_overflows++;
-        return;
+        return 0U;
     }
 
     sample_ring[head].tick_ms = HAL_GetTick();
@@ -412,44 +744,22 @@ static void ADS_CaptureFromISR(void)
     ring_head = next;
     total_samples_acquired++;
     if (total_samples_acquired >= 2U) ads_stream_stage = 100U;
+    return 1U;
 }
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == GPIO_PIN_9)
-    {
-        ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
-        ads_drdy_irq_count++;
-        ads_last_irq_tick = HAL_GetTick();
-        if (acquisition_enabled) ADS_CaptureFromISR();
-    }
-}
-
-/* The validated sensor firmware polls PB9. Keep EXTI as the normal fast path,
- * but fall back to that proven behavior if no DRDY interrupt is observed for
- * several expected frames at 250 SPS. */
+/* Poll the board-validated PA0 DRDY# connection at the 250 SPS frame period. */
 static void ADS_Service(void)
 {
     if (!acquisition_enabled) return;
 
     uint32_t now = HAL_GetTick();
-    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
-
-    if ((ads_capture_mode == 1U) && ((now - ads_last_irq_tick) >= ADS_DRDY_FALLBACK_MS))
-    {
-        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
-        ads_capture_mode = 2U;
-        ads_stream_stage = 30U;
-        ads_last_poll_tick = now;
-    }
+    ads_drdy_pin_state = (uint32_t)HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN);
 
     if ((ads_capture_mode == 2U) && ((now - ads_last_poll_tick) >= ADS_POLL_INTERVAL_MS) &&
-        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_RESET))
+        (HAL_GPIO_ReadPin(ADS_DRDY_PORT, ADS_DRDY_PIN) == GPIO_PIN_RESET))
     {
         ads_last_poll_tick = now;
-        ADS_CaptureFromISR();
-        ads_poll_capture_count++;
+        if (ADS_CaptureFrame()) ads_poll_capture_count++;
     }
 }
 
@@ -783,7 +1093,13 @@ static HAL_StatusTypeDef Modem_StartRx(void)
 {
     Modem_StopRx();
     uint8_t byte;
-    while (HAL_UART_Receive(&huart1, &byte, 1U, 1U) == HAL_OK) {}
+    uint32_t drained = 0U;
+    for (; drained < MODEM_RX_DRAIN_MAX_BYTES; drained++)
+    {
+        if (HAL_UART_Receive(&huart1, &byte, 1U, 1U) != HAL_OK) break;
+    }
+    modem_rx_drain_bytes = drained;
+    if (drained >= MODEM_RX_DRAIN_MAX_BYTES) modem_rx_drain_limit_hits++;
     memset((char *)modem_rx, 0, sizeof(modem_rx));
     modem_rx_len = 0U;
     uart_error_flags = 0U;
@@ -1302,8 +1618,6 @@ static void Handle_ADSStartFailure(void)
     acquisition_enabled = 0U;
     ads_has_started = 0U;
     ads_capture_mode = 0U;
-    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
 
     if (log_open)
     {
@@ -1348,8 +1662,6 @@ static void Handle_SDRecordStall(void)
     ADS_StopAcquisition();
     acquisition_enabled = 0U;
     ads_capture_mode = 0U;
-    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_9);
 
     if (log_open)
     {
@@ -1646,7 +1958,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
     hspi1.Init.CRCPolynomial = 7;
     hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-    hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+    hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
     if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
 }
 
@@ -1694,6 +2006,11 @@ static void MX_GPIO_Init(void)
     gpio.Mode = GPIO_MODE_IT_FALLING;
     gpio.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = ADS_DRDY_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(ADS_DRDY_PORT, &gpio);
 }
 
 void Error_Handler(void)

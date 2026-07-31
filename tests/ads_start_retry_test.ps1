@@ -15,13 +15,11 @@ foreach ($pattern in $required) {
 }
 
 $stopStart = $source.IndexOf('static void ADS_StopAcquisition(void)')
-$stopEnd = $source.IndexOf('static void ADS_CaptureFromISR(void)', $stopStart)
+$stopEnd = $source.LastIndexOf('static uint8_t ADS_CaptureFrame(void)')
 if (($stopStart -lt 0) -or ($stopEnd -lt 0)) { throw 'Could not isolate ADS stop function' }
 $stop = $source.Substring($stopStart, $stopEnd - $stopStart)
-$sdatac = $stop.IndexOf('ADS_Command(0x11U)')
-$stopCommand = $stop.IndexOf('ADS_Command(0x0AU)')
-if (($sdatac -lt 0) -or ($stopCommand -lt 0) -or ($sdatac -gt $stopCommand)) {
-    throw 'ADS shutdown must issue SDATAC before STOP.'
+if ($stop.IndexOf('ADS_EnterCommandMode()') -lt 0) {
+    throw 'ADS shutdown must use the verified SDATAC/STOP command-mode transition.'
 }
 
 Write-Output 'ADS full-reset startup retry contract: PASS'

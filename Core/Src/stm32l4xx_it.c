@@ -208,7 +208,7 @@ void USART1_IRQHandler(void)
 }
 
 /**
-  * @brief Handle ADS1292R DRDY on PB9.
+ * @brief Handle the board interrupt routed to PB9.
   */
 void EXTI9_5_IRQHandler(void)
 {

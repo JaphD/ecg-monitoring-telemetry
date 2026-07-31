@@ -2,8 +2,11 @@ $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw (Join-Path $PSScriptRoot '..\Core\Src\main.c')
 
 $patterns = @(
+  '#define MODEM_RX_DRAIN_MAX_BYTES\s+64U',
   'modem_boot_stage',
   'modem_boot_failure',
+  'modem_rx_drain_bytes',
+  'modem_rx_drain_limit_hits',
   'Modem_TryAT',
   'Modem_ServiceDelay',
   'probing existing power',
@@ -15,6 +18,20 @@ $patterns = @(
 )
 foreach ($pattern in $patterns) {
   if ($source -notmatch $pattern) { throw "Missing modem boot behavior: $pattern" }
+}
+
+$rxStart = $source.IndexOf('static HAL_StatusTypeDef Modem_StartRx(void)')
+$rxEnd = $source.IndexOf('void HAL_UART_RxCpltCallback', $rxStart)
+if (($rxStart -lt 0) -or ($rxEnd -lt 0)) {
+  throw 'Could not isolate Modem_StartRx.'
+}
+$rx = $source.Substring($rxStart, $rxEnd - $rxStart)
+if ($rx -match 'while\s*\(\s*HAL_UART_Receive') {
+  throw 'Modem_StartRx must not use an unbounded receive-drain loop.'
+}
+if (($rx -notmatch 'drained < MODEM_RX_DRAIN_MAX_BYTES') -or
+    ($rx -notmatch 'modem_rx_drain_limit_hits\+\+')) {
+  throw 'Modem RX drain must stop at a debugger-visible byte limit.'
 }
 
 $bootStart = $source.IndexOf('static uint8_t Modem_Boot(void)')
