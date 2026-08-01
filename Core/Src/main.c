@@ -81,6 +81,8 @@ static void MX_USART1_UART_Init(void);
 #define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
 #define ACTIVE_LOG_NAME            "ACTIVE.TMP"
 #define CSV_HEADER                 "timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n"
+#define DEVICE_ID_BUFFER_SIZE       31U
+#define DEVICE_METADATA_BUFFER_SIZE 48U
 
 typedef struct
 {
@@ -126,6 +128,7 @@ static volatile uint8_t modem_rx_active = 0U;
 
 /* Live Expressions */
 volatile char system_status[128] = "Booting";
+volatile char device_id[DEVICE_ID_BUFFER_SIZE] = {0};
 volatile uint32_t system_phase = 0U;
 volatile uint32_t record_sessions_completed = 0U;
 volatile uint32_t upload_phases_completed = 0U;
@@ -242,6 +245,8 @@ static FRESULT Logger_SyncActiveFile(void);
 static void Handle_ADSStartFailure(void);
 static void Handle_SDRecordStall(void);
 static void Run_SDRecoveryIfNeeded(void);
+static void DeviceIdentity_Init(void);
+static uint32_t Logger_NewPreambleSize(void);
 
 static void ADS_ResetStreamDiagnostics(void)
 {
@@ -790,6 +795,22 @@ static void LIS3DH_Service(void)
     }
 }
 
+static void DeviceIdentity_Init(void)
+{
+    (void)snprintf((char *)device_id, sizeof(device_id),
+                   "STM32-%08lX%08lX%08lX",
+                   (unsigned long)HAL_GetUIDw0(),
+                   (unsigned long)HAL_GetUIDw1(),
+                   (unsigned long)HAL_GetUIDw2());
+}
+
+static uint32_t Logger_NewPreambleSize(void)
+{
+    return (uint32_t)(strlen("device_id,") +
+                      strlen((const char *)device_id) +
+                      strlen("\r\n") + strlen(CSV_HEADER));
+}
+
 static void MakePath(char *out, size_t out_size, const char *name)
 {
     (void)snprintf(out, out_size, "%s%s", SDPath, name);
@@ -803,13 +824,38 @@ static void ReadyName(char *out, size_t out_size, uint32_t sequence)
 static FRESULT Logger_OpenActive(void)
 {
     char path[32];
+    char metadata[DEVICE_METADATA_BUFFER_SIZE];
     MakePath(path, sizeof(path), ACTIVE_LOG_NAME);
     FRESULT result = f_open(&log_file, path, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) return result;
     log_open = 1U;
     log_rows = 0U;
     snprintf((char *)current_log_filename, sizeof(current_log_filename), "%s", path);
+
+    int metadata_length = snprintf(metadata, sizeof(metadata),
+                                   "device_id,%s\r\n",
+                                   (const char *)device_id);
+    if ((metadata_length <= 0) ||
+        ((size_t)metadata_length >= sizeof(metadata)))
+    {
+        sd_write_errors++;
+        sd_logger_write_fault = 1U;
+        sd_last_write_result = (uint32_t)FR_INVALID_PARAMETER;
+        return FR_INVALID_PARAMETER;
+    }
+
     UINT written = 0U;
+    result = f_write(&log_file, metadata, (UINT)metadata_length, &written);
+    if ((result != FR_OK) || (written != (UINT)metadata_length))
+    {
+        sd_write_errors++;
+        sd_logger_write_fault = 1U;
+        sd_last_write_result = (uint32_t)result;
+        sd_write_retry_tick = HAL_GetTick();
+        return result == FR_OK ? FR_DISK_ERR : result;
+    }
+
+    written = 0U;
     result = f_write(&log_file, CSV_HEADER, strlen(CSV_HEADER), &written);
     if ((result != FR_OK) || (written != strlen(CSV_HEADER)))
     {
@@ -1038,7 +1084,9 @@ static void Logger_RecoverQueue(void)
     FILINFO info;
     if (f_stat(active_path, &info) == FR_OK)
     {
-        if (info.fsize <= strlen(CSV_HEADER))
+        uint32_t empty_file_limit = Logger_NewPreambleSize();
+        if ((info.fsize <= strlen(CSV_HEADER)) ||
+            (info.fsize == empty_file_limit))
         {
             (void)f_unlink(active_path);
         }
@@ -1539,7 +1587,9 @@ static void Upload_OldestReady(void)
         return;
     }
     last_upload_file_size = (uint32_t)info.fsize;
-    if (info.fsize <= strlen(CSV_HEADER))
+    uint32_t empty_file_limit = Logger_NewPreambleSize();
+    if ((info.fsize <= strlen(CSV_HEADER)) ||
+        (info.fsize == empty_file_limit))
     {
         if (f_unlink(path) == FR_OK && sd_files_queued > 0U) sd_files_queued--;
         snprintf((char *)system_status, sizeof(system_status),
@@ -1857,6 +1907,7 @@ static void Drain_UploadQueueBeforeNextRecord(void)
 int main(void)
 {
     HAL_Init();
+    DeviceIdentity_Init();
     SystemClock_Config();
     MX_GPIO_Init();
     MX_I2C1_Init();
