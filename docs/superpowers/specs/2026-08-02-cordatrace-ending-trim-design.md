@@ -11,7 +11,8 @@ Within the corrected demonstration segment:
 1. Retain approximately 2-3 seconds after the modem indicator begins blinking so the transmission attempt remains visible.
 2. Remove the subsequent inactive wait of more than 30 seconds.
 3. Resume at the first successful POST/dashboard update where the received ECG waveform becomes visible.
-4. Retain approximately 6-8 seconds of the completed waveform as the final proof point.
+4. Continue through the second successful upload/dashboard refresh.
+5. Retain approximately 3-5 seconds after the second waveform update is visibly established.
 
 Use a direct cut. Do not add a speed ramp, transition, caption, music, or source audio. The cut should communicate cause and result without implying that the network response was instantaneous.
 
@@ -23,12 +24,13 @@ Export a new MP4 revision without overwriting previous cuts:
 - 30 fps
 - H.264
 - no audio
-- expected duration approximately 2:00-2:10
+- expected duration approximately 2:00-2:12
 
 ## Acceptance Checks
 
 - The ending shows modem activity, then the successful dashboard waveform.
 - No inactive 30-second wait remains.
-- The final waveform is held long enough to read.
+- The second upload and its resulting waveform update are visible.
+- The final waveform is held long enough to read after the second upload.
 - Earlier footage is unchanged.
 - Existing exported files remain preserved.
