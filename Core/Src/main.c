@@ -76,6 +76,8 @@ static void MX_USART1_UART_Init(void);
 #define ADS_STREAM_STATS_SAMPLES   500U
 #define ADS_POLL_INTERVAL_MS       4U
 #define MODEM_RAIL_SETTLE_MS       100U
+/* Controlled A/B: retain the modem rail across normal cycles; 715 recovery may still cycle it. */
+#define MODEM_HOLD_POWER_AB_TEST 1U
 #define MAX_HTTPDATA_BYTES         100000U
 #define MODEM_APN                  "internet"
 #define MODEM_RX_DRAIN_MAX_BYTES   64U
@@ -174,6 +176,26 @@ volatile uint32_t current_http_status = 0U;
 volatile uint32_t tls_handshake_failures = 0U;
 volatile uint32_t tls_recovery_pending = 0U;
 volatile uint32_t tls_recovery_cycles = 0U;
+volatile uint32_t modem_hold_power_ab_test = MODEM_HOLD_POWER_AB_TEST;
+volatile uint32_t http_attempts_total = 0U;
+volatile uint32_t http_status_200_count = 0U;
+volatile uint32_t http_status_715_count = 0U;
+volatile uint32_t http_status_422_count = 0U;
+volatile uint32_t http_status_other_count = 0U;
+volatile uint32_t httpaction_wait_failures = 0U;
+volatile uint32_t httpterm_failures = 0U;
+volatile uint32_t httpinit_failures = 0U;
+volatile uint32_t http_success_attempt1_count = 0U;
+volatile uint32_t http_success_attempt2_count = 0U;
+volatile uint32_t http_success_attempt3_count = 0U;
+volatile uint32_t http_last_attempt_duration_ms = 0U;
+volatile uint32_t http_last_action_duration_ms = 0U;
+volatile uint32_t http_last_failure_status = 0U;
+volatile uint32_t http_last_failure_attempt = 0U;
+volatile uint32_t http_last_failure_duration_ms = 0U;
+volatile uint32_t http_last_failure_power_age_ms = 0U;
+volatile char http_last_failure_step[64] = {0};
+volatile char http_last_failure_response[512] = {0};
 volatile uint32_t sd_unlink_result = 0U;
 volatile uint32_t upload_delete_failures = 0U;
 volatile uint32_t upload_oversize_files = 0U;
@@ -1614,9 +1636,12 @@ static uint8_t HTTP_PostFile(const char *path)
     FIL upload;
     FILINFO info;
     uint8_t upload_open = 0U;
+    uint32_t attempt_start_tick = HAL_GetTick();
+    http_last_action_duration_ms = 0U;
     if (f_stat(path, &info) != FR_OK)
     {
         Upload_CaptureFailure("FILE_STAT");
+        http_last_attempt_duration_ms = HAL_GetTick() - attempt_start_tick;
         return 0U;
     }
     uint32_t file_size = (uint32_t)info.fsize;
@@ -1633,6 +1658,7 @@ static uint8_t HTTP_PostFile(const char *path)
     (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
     if (!Modem_Command("AT+HTTPINIT\r\n", "OK", 5000U, 0U))
     {
+        httpinit_failures++;
         Upload_CaptureFailure("HTTPINIT");
         goto done;
     }
@@ -1717,12 +1743,16 @@ static uint8_t HTTP_PostFile(const char *path)
     upload_stage = 50U;
     Modem_StopRx();
 
+    uint32_t action_start_tick = HAL_GetTick();
     if (!Modem_Command("AT+HTTPACTION=1\r\n", "+HTTPACTION:",
                        65000U, 1U))
     {
+        http_last_action_duration_ms = HAL_GetTick() - action_start_tick;
+        httpaction_wait_failures++;
         Upload_CaptureFailure("HTTPACTION_WAIT");
         goto terminate;
     }
+    http_last_action_duration_ms = HAL_GetTick() - action_start_tick;
     {
         const char *action = strstr((const char *)last_modem_response, "+HTTPACTION:");
         unsigned long status = 0U, response_length = 0U;
@@ -1732,7 +1762,22 @@ static uint8_t HTTP_PostFile(const char *path)
         {
             current_http_status = (uint32_t)status;
             last_http_status = current_http_status;
-            if (current_http_status == 715U) tls_handshake_failures++;
+            switch (current_http_status)
+            {
+                case 200U:
+                    http_status_200_count++;
+                    break;
+                case 715U:
+                    http_status_715_count++;
+                    tls_handshake_failures++;
+                    break;
+                case 422U:
+                    http_status_422_count++;
+                    break;
+                default:
+                    http_status_other_count++;
+                    break;
+            }
             success = (status == 200U) ? 1U : 0U;
             if (success) upload_stage = 70U;
             else Upload_CaptureFailure("HTTP_STATUS");
@@ -1742,11 +1787,15 @@ static uint8_t HTTP_PostFile(const char *path)
 
 terminate:
     upload_stage = success ? 80U : upload_stage;
-    (void)Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U);
+    if (!Modem_Command("AT+HTTPTERM\r\n", "OK", 3000U, 0U))
+    {
+        httpterm_failures++;
+    }
 done:
     if (upload_open) (void)f_close(&upload);
     sd_upload_read_active = 0U;
     if (!success) upload_stage = 255U;
+    http_last_attempt_duration_ms = HAL_GetTick() - attempt_start_tick;
     return success;
 }
 
@@ -1810,8 +1859,23 @@ static void Upload_OldestReady(void)
         last_upload_attempts = attempt;
         snprintf((char *)system_status, sizeof(system_status),
                  "Uploading %s attempt %lu", path, (unsigned long)attempt);
+        http_attempts_total++;
         if (HTTP_PostFile(path))
         {
+            switch (attempt)
+            {
+                case 1U:
+                    http_success_attempt1_count++;
+                    break;
+                case 2U:
+                    http_success_attempt2_count++;
+                    break;
+                case 3U:
+                    http_success_attempt3_count++;
+                    break;
+                default:
+                    break;
+            }
             upload_stage = 90U;
             uploads_ok++;
             sd_unlink_result = (uint32_t)f_unlink(path);
@@ -1823,6 +1887,18 @@ static void Upload_OldestReady(void)
             uploaded = 1U;
             break;
         }
+        http_last_failure_status = current_http_status;
+        http_last_failure_attempt = attempt;
+        http_last_failure_duration_ms = http_last_attempt_duration_ms;
+        http_last_failure_power_age_ms =
+            (modem_power_state != 0U) ?
+            (HAL_GetTick() - modem_power_last_transition_tick) : 0U;
+        snprintf((char *)http_last_failure_step,
+                 sizeof(http_last_failure_step), "%s",
+                 (const char *)upload_failure_step);
+        snprintf((char *)http_last_failure_response,
+                 sizeof(http_last_failure_response), "%s",
+                 (const char *)upload_failure_response);
         if (current_http_status == 715U) saw_tls_715 = 1U;
         if (attempt < HTTP_MAX_ATTEMPTS)
         {
@@ -1953,7 +2029,9 @@ static void Run_SDRecoveryIfNeeded(void)
 
 static void Run_RecordPhase(void)
 {
+#if MODEM_HOLD_POWER_AB_TEST == 0U
     ModemPower_Disable("recording");
+#endif
     system_phase = 20U;
     snprintf((char *)system_status, sizeof(system_status),
              "Recording session %lu", (unsigned long)(record_sessions_completed + 1U));
@@ -2080,7 +2158,9 @@ static void Run_UploadPhase(void)
     upload_phases_completed++;
     system_phase = 100U;
     snprintf((char *)system_status, sizeof(system_status), "Upload queue drained");
+#if MODEM_HOLD_POWER_AB_TEST == 0U
     ModemPower_Disable("upload complete");
+#endif
 }
 
 static void Drain_UploadQueueBeforeNextRecord(void)
