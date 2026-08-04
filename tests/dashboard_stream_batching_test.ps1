@@ -3,13 +3,15 @@ $ErrorActionPreference = 'Stop'
 $dashboardRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..\Web-Dashboard')
 $server = Get-Content -Raw (Join-Path $dashboardRoot 'server.js')
 $html = Get-Content -Raw (Join-Path $dashboardRoot 'dashboard.html')
+$parser = Get-Content -Raw (Join-Path $dashboardRoot 'telemetry-parser.js')
 
 $serverPatterns = @(
-    'SSE_BATCH_INTERVAL_MS',
-    'pendingRows',
-    'queueSSE',
-    'flushSSEBatch',
-    'broadcastSSE\("sensor-batch"'
+    'createUploadParser',
+    'broadcastTelemetryBatch',
+    'broadcastSSE\("telemetry-batch"',
+    'part_index',
+    'part_count',
+    'res\.status\(result\.status\)'
 )
 
 foreach ($pattern in $serverPatterns) {
@@ -19,12 +21,10 @@ foreach ($pattern in $serverPatterns) {
 }
 
 $htmlPatterns = @(
-    'RENDER_INTERVAL_MS',
-    'pendingRows',
-    'flushPendingRows',
-    'requestAnimationFrame',
-    'addEventListener\("sensor-batch"',
-    'updateCharts',
+    'uploadAssemblies',
+    'acceptBatchPart',
+    'renderCompleteUpload',
+    'addEventListener\("telemetry-batch"',
     '<div class="stat-unit">mg</div>',
     '<div class="label">mg</div>'
 )
@@ -35,18 +35,30 @@ foreach ($pattern in $htmlPatterns) {
     }
 }
 
-$pushStart = $html.IndexOf('function pushPoint(chart, label, ...vals)')
-$pushEnd = $html.IndexOf('function updateCharts()', $pushStart)
-if (($pushStart -lt 0) -or ($pushEnd -lt 0) -or ($pushEnd -le $pushStart)) {
-    throw 'Unable to locate pushPoint function body.'
+if ($html -match 'let activeDeviceId' -or
+    $html -match 'activeDeviceId\s*&&\s*device\.id') {
+    throw 'Dashboard must not remain locked to the first device UID in the browser session.'
 }
-$pushBody = $html.Substring($pushStart, $pushEnd - $pushStart)
-if ($pushBody -match 'chart\.update\("none"\)') {
-    throw 'pushPoint must not call Chart.js update once per row.'
+
+if ($html -notmatch 'assembly\.deviceId\s*!==\s*device\.id') {
+    throw 'Dashboard must retain per-upload device-ID consistency validation.'
 }
 
 if ($html -match 'm/s') {
     throw 'Dashboard must label LIS3DH acceleration as mg, not m/s^2.'
 }
 
-Write-Output 'Dashboard SSE batching/render throttling contract: PASS'
+$removedIdentityPatterns = @(
+    'ECG_MONITOR_01_UID',
+    'buildAliases',
+    'Unregistered ECG Monitor',
+    'UID UNREGISTERED'
+)
+
+foreach ($pattern in $removedIdentityPatterns) {
+    if (($server + $html + $parser) -match $pattern) {
+        throw "Friendly-name registration behavior must be removed: $pattern"
+    }
+}
+
+Write-Output 'Dashboard identified SSE batching contract: PASS'

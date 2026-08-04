@@ -2,10 +2,12 @@ $ErrorActionPreference = 'Stop'
 
 $firmware = Get-Content -Raw (Join-Path $PSScriptRoot '..\Core\Src\main.c')
 $server = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\server.js')
+$parser = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\telemetry-parser.js')
 
 $firmwareRequired = @(
     '#define SAMPLES_PER_FILE\s+2500U',
     '#define MAX_HTTPDATA_BYTES\s+100000U',
+    'STM32-%08lX%08lX%08lX',
     'device_id,%s\\r\\n',
     'static uint8_t HTTP_PostFile\(const char \*path\)',
     'AT\+HTTPPARA=\\"CONTENT\\",\\"text/csv\\"',
@@ -39,15 +41,17 @@ foreach ($pattern in $firmwareForbidden) {
     }
 }
 
-$serverRequired = @(
+$dashboardRequired = @(
+    'createUploadParser',
+    'telemetry-batch',
     'startsWith\("device_id,"\)',
-    'state\.deviceId',
-    'device_id:\s*deviceId',
-    'accepted:\s*state\.accepted'
+    'state\.device',
+    'device_id:\s*result\.batch\.device\.id',
+    'accepted:\s*state\.rows\.length'
 )
 
-foreach ($pattern in $serverRequired) {
-    if ($server -notmatch $pattern) {
+foreach ($pattern in $dashboardRequired) {
+    if (($server + $parser) -notmatch $pattern) {
         throw "Missing dashboard CSV/device contract: $pattern"
     }
 }
@@ -58,4 +62,4 @@ if ($server -match 'app\.get\("/api/time"' -or
     throw 'Dashboard still contains the retired network-time or JSON batch path.'
 }
 
-Write-Output 'V1 main-style CSV/device upload contract: PASS'
+Write-Output 'V1 identified CSV upload contract: PASS'

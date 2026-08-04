@@ -5,9 +5,6 @@ $required = @(
     'tls_handshake_failures',
     'tls_recovery_pending',
     'tls_recovery_cycles',
-    'AT+CSSLCFG=\"sslversion\",0,3',
-    'AT+CSSLCFG=\"enableSNI\",0,1',
-    'AT+HTTPPARA=\"SSLCFG\",0',
     'current_http_status == 715U',
     'ModemPower_Disable("TLS 715 recovery")'
 )
@@ -18,7 +15,25 @@ foreach ($item in $required) {
     }
 }
 
+$httpStart = $source.IndexOf('static uint8_t HTTP_PostFile(')
 $uploadStart = $source.IndexOf('static void Upload_OldestReady(void)')
+if (($httpStart -lt 0) -or ($uploadStart -lt 0) -or ($uploadStart -le $httpStart)) {
+    throw 'HTTP post or upload function not found.'
+}
+
+$httpText = $source.Substring($httpStart, $uploadStart - $httpStart)
+$unsupportedOverrides = @(
+    'AT+CSSLCFG=\"sslversion\"',
+    'AT+CSSLCFG=\"enableSNI\"',
+    'AT+HTTPPARA=\"SSLCFG\"'
+)
+
+foreach ($item in $unsupportedOverrides) {
+    if ($httpText -match [regex]::Escape($item)) {
+        throw "HTTPS transaction must use the validated modem-default TLS context: $item"
+    }
+}
+
 $drainStart = $source.IndexOf('static void Drain_UploadQueueBeforeNextRecord(void)')
 if (($uploadStart -lt 0) -or ($drainStart -lt 0)) {
     throw 'Upload or queue-drain function not found.'
