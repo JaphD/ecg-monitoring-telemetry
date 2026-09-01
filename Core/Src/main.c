@@ -81,7 +81,7 @@ static void MX_USART1_UART_Init(void);
 #define MAX_HTTPDATA_BYTES         100000U
 #define MODEM_APN                  "internet"
 #define MODEM_RX_DRAIN_MAX_BYTES   64U
-#define UPLOAD_URL                 "https://carton-cupping-modify.ngrok-free.dev/api/data"
+#define UPLOAD_URL                 "https://ecg-dashboard-1h8s.onrender.com/api/ingest"
 #define ACTIVE_LOG_NAME            "ACTIVE.TMP"
 #define CSV_HEADER                 "timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2\r\n"
 #define DEVICE_ID_BUFFER_SIZE       31U
