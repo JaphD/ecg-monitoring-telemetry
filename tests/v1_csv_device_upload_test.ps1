@@ -1,8 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $firmware = Get-Content -Raw (Join-Path $PSScriptRoot '..\Core\Src\main.c')
-$server = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\server.js')
-$parser = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Web-Dashboard\telemetry-parser.js')
+$dashboardRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..\ECG_DASHBOARD')
+$server = Get-Content -Raw (Join-Path $dashboardRoot 'server.ts')
+$contract = Get-Content -Raw (Join-Path $dashboardRoot 'src\lib\telemetry-contract.mjs')
 
 $firmwareRequired = @(
     '#define SAMPLES_PER_FILE\s+2500U',
@@ -42,24 +43,18 @@ foreach ($pattern in $firmwareForbidden) {
 }
 
 $dashboardRequired = @(
-    'createUploadParser',
-    'telemetry-batch',
-    'startsWith\("device_id,"\)',
-    'state\.device',
-    'device_id:\s*result\.batch\.device\.id',
-    'accepted:\s*state\.rows\.length'
+    'parseV1Csv',
+    'CSV device_id must match STM32-',
+    'timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2',
+    "app\.post\('/api/ingest'",
+    'eq\(devices\.id, parsed\.deviceId\)',
+    'samplesReceived: parsed\.readings\.length'
 )
 
 foreach ($pattern in $dashboardRequired) {
-    if (($server + $parser) -notmatch $pattern) {
+    if (($server + $contract) -notmatch $pattern) {
         throw "Missing dashboard CSV/device contract: $pattern"
     }
-}
-
-if ($server -match 'app\.get\("/api/time"' -or
-    $server -match 'acceptedBatches' -or
-    $server -match 'express\.json') {
-    throw 'Dashboard still contains the retired network-time or JSON batch path.'
 }
 
 Write-Output 'V1 identified CSV upload contract: PASS'

@@ -292,6 +292,11 @@ volatile uint32_t modem_forced_recovery_attempts = 0U;
 volatile uint32_t modem_rx_start_failures = 0U;
 volatile uint32_t modem_tx_failures = 0U;
 volatile uint32_t modem_command_timeouts = 0U;
+volatile uint32_t battery_voltage_mv = 0U;
+volatile uint32_t battery_query_successes = 0U;
+volatile uint32_t battery_query_failures = 0U;
+volatile uint32_t battery_header_failures = 0U;
+volatile char battery_last_response[64] = {0};
 volatile char upload_failure_step[64] = {0};
 volatile char upload_failure_response[512] = {0};
 volatile char record_abort_reason[64] = {0};
@@ -1593,6 +1598,77 @@ static uint8_t ModemPower_BootForUpload(void)
     return 1U;
 }
 
+static uint8_t Modem_ParseBatteryMillivolts(const char *response,
+                                            uint32_t *voltage_mv)
+{
+    const char *value = strstr(response, "+CBC:");
+    if ((value == NULL) || (voltage_mv == NULL)) return 0U;
+    value += strlen("+CBC:");
+    while ((*value == ' ') || (*value == '\t')) value++;
+
+    uint32_t whole = 0U;
+    uint8_t whole_digits = 0U;
+    while ((*value >= '0') && (*value <= '9'))
+    {
+        whole = (whole * 10U) + (uint32_t)(*value - '0');
+        whole_digits++;
+        value++;
+    }
+    if (whole_digits == 0U) return 0U;
+
+    uint32_t parsed_mv = whole;
+    if (*value == '.')
+    {
+        uint32_t fractional_mv = 0U;
+        uint32_t scale = 100U;
+        uint8_t fractional_digits = 0U;
+        value++;
+        while ((*value >= '0') && (*value <= '9'))
+        {
+            if (scale > 0U)
+            {
+                fractional_mv += (uint32_t)(*value - '0') * scale;
+                scale /= 10U;
+            }
+            fractional_digits++;
+            value++;
+        }
+        if (fractional_digits == 0U) return 0U;
+        parsed_mv = (whole * 1000U) + fractional_mv;
+    }
+
+    if ((parsed_mv < 2500U) || (parsed_mv > 5000U)) return 0U;
+    *voltage_mv = parsed_mv;
+    return 1U;
+}
+
+static uint8_t Modem_ReadBatteryVoltage(void)
+{
+    uint32_t parsed_mv = 0U;
+    battery_voltage_mv = 0U;
+    battery_last_response[0] = '\0';
+
+    if (!Modem_Command("AT+CBC\r\n", "+CBC:", 3000U, 1U))
+    {
+        battery_query_failures++;
+        return 0U;
+    }
+
+    snprintf((char *)battery_last_response, sizeof(battery_last_response),
+             "%.*s", (int)(sizeof(battery_last_response) - 1U),
+             (const char *)last_modem_response);
+    if (!Modem_ParseBatteryMillivolts((const char *)last_modem_response,
+                                      &parsed_mv))
+    {
+        battery_query_failures++;
+        return 0U;
+    }
+
+    battery_voltage_mv = parsed_mv;
+    battery_query_successes++;
+    return 1U;
+}
+
 static void Upload_CaptureFailure(const char *step)
 {
     snprintf((char *)upload_failure_step, sizeof(upload_failure_step), "%s", step);
@@ -1679,6 +1755,14 @@ static uint8_t HTTP_PostFile(const char *path)
     {
         Upload_CaptureFailure("CONTENT");
         goto terminate;
+    }
+    if (battery_voltage_mv > 0U)
+    {
+        snprintf(command, sizeof(command),
+                 "AT+HTTPPARA=\"USERDATA\",\"X-Battery-Millivolts: %lu\"\r\n",
+                 (unsigned long)battery_voltage_mv);
+        if (!Modem_Command(command, "OK", 3000U, 0U))
+            battery_header_failures++;
     }
     snprintf(command, sizeof(command), "AT+HTTPDATA=%lu,60000\r\n",
              (unsigned long)file_size);
@@ -2143,6 +2227,7 @@ static void Run_UploadPhase(void)
         system_phase = 50U;
         return;
     }
+    (void)Modem_ReadBatteryVoltage();
     system_phase = 40U;
     snprintf((char *)system_status, sizeof(system_status),
              "Uploading %lu queued files", (unsigned long)sd_files_queued);

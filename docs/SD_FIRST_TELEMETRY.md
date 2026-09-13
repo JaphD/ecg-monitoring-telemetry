@@ -1,54 +1,66 @@
-# SD-First Telemetry Board Test
+# V1 SD-first telemetry test
 
-The firmware continuously samples ECG at 500 SPS, reads LIS3DH acceleration at 50 Hz, writes exact six-column CSV batches to SD, and uploads the oldest closed batch to the Node.js endpoint.
+The `v1-lipo-modem-gate` firmware records ADS1292R ECG at 250 SPS and reads
+LIS3DH acceleration at 50 Hz. Each closed SD file contains 2,500 ECG rows,
+representing about 10 seconds. The six-column CSV remains the durable upload
+payload, and a file is deleted only after HTTP 200.
 
-## Live Expressions
+The current upload endpoint is:
+
+```text
+https://ecg-dashboard-1h8s.onrender.com/api/ingest
+```
+
+## Essential Live Expressions
 
 ```text
 (char *)system_status
-total_samples_acquired
-total_samples_logged
-sample_ring_overflows
-sd_write_errors
-sd_files_queued
+record_sessions_completed
 uploads_ok
 uploads_failed
 last_http_status
 last_upload_attempts
-last_upload_file_size
-uart_error_flags
-uart_overruns
-ads_id_value
-ads_drdy_irq_count
+sd_files_queued
+ads_measured_rate_millihz
+sample_ring_overflows
 ads_spi_errors
+sd_write_errors
 (char *)upload_failure_step
 (char *)upload_failure_response
-modem_boot_stage
-(char *)modem_boot_failure
-(char *)modem_boot_last_response
-(char *)current_log_filename
-(char *)current_upload_filename
-(char *)last_modem_response
-modem_power_requested
-modem_power_state
-modem_power_stage
-modem_power_last_transition_tick
-modem_power_enables
-modem_power_disables
-modem_power_cycles
-(char *)modem_power_last_on_reason
-(char *)modem_power_last_off_reason
+battery_voltage_mv
+battery_query_failures
+battery_header_failures
+(char *)battery_last_response
 ```
 
-## V1 LiPo Modem Power Gate
+Healthy acquisition keeps `ads_measured_rate_millihz` near `250000`, advances
+the recording and upload counters, and leaves the acquisition, ring, and SD
+error counters at zero. A transient HTTP 715 is retried as a complete HTTP
+session after five seconds; its `.RDY` file remains queued until HTTP 200.
 
-For V1, PB8 controls the TPS22969DNYR rail to the A7670G. `modem_power_state`
-is `0` when the rail is off and `1` after the 100 ms rail-settle interval.
-`modem_power_stage` is `10` while the rail is settling, `20` while the modem
-boot sequence runs, `30` when the modem is ready for upload, and `0` when it
-is off. The reason strings show why the last transition occurred. During ECG
-recording and the 60-second retry idle interval the expected state is OFF.
+## V1 Li-Po modem power and battery measurement
 
-Healthy operation has a nonzero ADS ID, continuously increasing DRDY/acquired/logged counts, zero SPI/ring/SD errors, and periodic `uploads_ok` increments. A transient modem status 715 is retried as a complete HTTP session after five seconds. The `.RDY` file remains on SD unless HTTP 200 is received.
+PB8 controls the TPS22969DNYR rail feeding the A7670G. The current
+`MODEM_HOLD_POWER_AB_TEST = 1` setting retains modem power across normal record
+and upload cycles to preserve the tested TLS behavior. The existing 715
+recovery path may still cycle the modem rail.
 
-The public ngrok URL is compiled into `UPLOAD_URL` in `Core/Src/main.c`. Update it whenever the free ngrok hostname changes.
+After a successful modem boot, firmware issues `AT+CBC`. The A7670G reports its
+supply voltage, which is the battery-fed modem rail on V1. A valid 2,500-5,000
+mV result is exposed in `battery_voltage_mv` and sent with each upload as:
+
+```text
+X-Battery-Millivolts: 3749
+```
+
+The header is optional. A failed query or header command increments its
+diagnostic counter but does not stop the ECG upload. The TirtaTrace server
+stores the voltage with the recording and does not infer a Li-Po percentage.
+
+## Current validation status
+
+As of 2026-09-13, the battery metadata change builds with GNU Tools for STM32
+14.3 and passes the firmware source-contract suite. It has not yet been
+validated on the physical V1 board. During the first run, confirm a plausible
+`battery_voltage_mv`, zero `battery_header_failures`, HTTP 200, and the same
+voltage on the latest TirtaTrace recording.

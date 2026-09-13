@@ -1,64 +1,31 @@
 $ErrorActionPreference = 'Stop'
 
-$dashboardRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..\Web-Dashboard')
-$server = Get-Content -Raw (Join-Path $dashboardRoot 'server.js')
-$html = Get-Content -Raw (Join-Path $dashboardRoot 'dashboard.html')
-$parser = Get-Content -Raw (Join-Path $dashboardRoot 'telemetry-parser.js')
+$dashboardRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..\ECG_DASHBOARD')
+$server = Get-Content -Raw (Join-Path $dashboardRoot 'server.ts')
+$hook = Get-Content -Raw (Join-Path $dashboardRoot 'src\hooks\useTelemetryStream.ts')
+$display = Get-Content -Raw (Join-Path $dashboardRoot 'src\components\TelemetryDashboard.tsx')
 
-$serverPatterns = @(
-    'createUploadParser',
-    'broadcastTelemetryBatch',
-    'broadcastSSE\("telemetry-batch"',
-    'part_index',
-    'part_count',
-    'res\.status\(result\.status\)'
+$required = @(
+    'MAX_BATCH_SIZE',
+    "app\.get\('/api/sessions/:deviceId'",
+    "app\.get\('/api/telemetry/:deviceId'",
+    'eq\(readings\.session_id, sessionId\)',
+    'Math\.ceil\(allRows\.length / targetPoints\)',
+    'selectedSessionId',
+    'elapsedSeconds',
+    'accelXMg',
+    'unit="mg"'
 )
 
-foreach ($pattern in $serverPatterns) {
-    if ($server -notmatch $pattern) {
-        throw "Missing server batching contract: $pattern"
+$source = $server + $hook + $display
+foreach ($pattern in $required) {
+    if ($source -notmatch $pattern) {
+        throw "Missing stored-session dashboard contract: $pattern"
     }
 }
 
-$htmlPatterns = @(
-    'uploadAssemblies',
-    'acceptBatchPart',
-    'renderCompleteUpload',
-    'addEventListener\("telemetry-batch"',
-    '<div class="stat-unit">mg</div>',
-    '<div class="label">mg</div>'
-)
-
-foreach ($pattern in $htmlPatterns) {
-    if ($html -notmatch $pattern) {
-        throw "Missing dashboard throttling contract: $pattern"
-    }
+if ($source -match 'telemetry-batch|EventSource|m/s') {
+    throw 'Dashboard must use stored session retrieval and label acceleration in mg.'
 }
 
-if ($html -match 'let activeDeviceId' -or
-    $html -match 'activeDeviceId\s*&&\s*device\.id') {
-    throw 'Dashboard must not remain locked to the first device UID in the browser session.'
-}
-
-if ($html -notmatch 'assembly\.deviceId\s*!==\s*device\.id') {
-    throw 'Dashboard must retain per-upload device-ID consistency validation.'
-}
-
-if ($html -match 'm/s') {
-    throw 'Dashboard must label LIS3DH acceleration as mg, not m/s^2.'
-}
-
-$removedIdentityPatterns = @(
-    'ECG_MONITOR_01_UID',
-    'buildAliases',
-    'Unregistered ECG Monitor',
-    'UID UNREGISTERED'
-)
-
-foreach ($pattern in $removedIdentityPatterns) {
-    if (($server + $html + $parser) -match $pattern) {
-        throw "Friendly-name registration behavior must be removed: $pattern"
-    }
-}
-
-Write-Output 'Dashboard identified SSE batching contract: PASS'
+Write-Output 'Dashboard stored-session batching contract: PASS'

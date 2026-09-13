@@ -36,6 +36,8 @@ The following branches preserve focused development and validation work. They ar
 - microSD logging through SDMMC and FatFS.
 - A7670G LTE network registration and server uplink.
 - STM32 unique-device identity included in telemetry.
+- Optional V1 battery-rail voltage metadata from `AT+CBC` (implemented on
+  `v1-lipo-modem-gate`; hardware validation pending).
 
 ## Repository layout
 
