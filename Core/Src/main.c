@@ -1662,6 +1662,12 @@ static uint8_t HTTP_PostFile(const char *path)
         Upload_CaptureFailure("HTTPINIT");
         goto done;
     }
+    if (!Modem_Command("AT+CSSLCFG=\"enableSNI\",0,1\r\n",
+                       "OK", 5000U, 0U))
+    {
+        Upload_CaptureFailure("TLS_SNI");
+        goto terminate;
+    }
     snprintf(command, sizeof(command), "AT+HTTPPARA=\"URL\",\"%s\"\r\n", UPLOAD_URL);
     if (!Modem_Command(command, "OK", 5000U, 0U))
     {

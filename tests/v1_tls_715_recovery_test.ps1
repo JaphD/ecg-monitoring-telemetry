@@ -22,16 +22,15 @@ if (($httpStart -lt 0) -or ($uploadStart -lt 0) -or ($uploadStart -le $httpStart
 }
 
 $httpText = $source.Substring($httpStart, $uploadStart - $httpStart)
-$unsupportedOverrides = @(
-    'AT+CSSLCFG=\"sslversion\"',
-    'AT+CSSLCFG=\"enableSNI\"',
-    'AT+HTTPPARA=\"SSLCFG\"'
-)
-
-foreach ($item in $unsupportedOverrides) {
-    if ($httpText -match [regex]::Escape($item)) {
-        throw "HTTPS transaction must use the validated modem-default TLS context: $item"
-    }
+$httpInit = $httpText.IndexOf('AT+HTTPINIT')
+$sniConfig = $httpText.IndexOf('AT+CSSLCFG=\"enableSNI\",0,1')
+$urlConfig = $httpText.IndexOf('AT+HTTPPARA=\"URL\"')
+if (($httpInit -lt 0) -or ($sniConfig -lt 0) -or ($urlConfig -lt 0) -or
+    -not (($httpInit -lt $sniConfig) -and ($sniConfig -lt $urlConfig))) {
+    throw 'HTTPS transaction must enable SNI on SSL context 0 after HTTPINIT and before applying the URL.'
+}
+if ($httpText -notmatch 'Upload_CaptureFailure\("TLS_SNI"\)') {
+    throw 'SNI configuration failure must be exposed as TLS_SNI.'
 }
 
 $drainStart = $source.IndexOf('static void Drain_UploadQueueBeforeNextRecord(void)')
