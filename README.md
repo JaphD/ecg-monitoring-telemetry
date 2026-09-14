@@ -1,55 +1,56 @@
-# ECG Monitoring and Telemetry Firmware
+# ECG Firmware — V1 Li-Po Modem-Gate Board
 
-Firmware for a wearable ECG monitoring system based on an STM32L452RET6. The platform combines an ADS1292R ECG analog front end, LIS3DH accelerometer, microSD storage, and A7670G LTE modem for local capture and remote telemetry.
+This branch supports the first portable ECG board: an STM32L452RET6 with an ADS1292R ECG front end, LIS3DH accelerometer, microSD storage, and an A7670G modem powered from the Li-Po rail through an MCU-controlled load switch. It is an engineering prototype and is not a certified medical device.
 
-This is an engineering and bring-up project. The ECG acquisition and telemetry paths have been exercised during development, but this repository does not represent a certified medical device or clinical diagnostic system.
+## Current baseline
 
-## Hardware targets and baseline branches
+- **Branch:** `v1-lipo-modem-gate`
+- **Firmware baseline:** `c485627`
+- **Server endpoint:** `https://ecg-dashboard-1h8s.onrender.com/api/ingest`
+- **Last combined test:** 21 recordings and 21 successful HTTP 200 uploads, with no upload, acquisition, or SD errors observed during that run.
 
-Two physical board variants are supported. Select the branch that matches the board before building, flashing, or changing board-specific behavior.
+The modem power gate, PWRKEY sequence, registration delays, and retry behavior are specific to V1. Do not replace them with assumptions from the externally powered V2 board without a new hardware test.
 
-| Branch | Hardware target | Purpose |
-| --- | --- | --- |
-| [`main`](../../tree/main) | **Rev 2 — USB-C / external-power version** | Baseline for the revised board, which uses downstream regulation and incorporates improved A7670G power distribution and grounding. |
-| [`v1-lipo-modem-gate`](../../tree/v1-lipo-modem-gate) | **Rev 1 — Li-Po battery version** | Baseline for the portable battery-powered board, including its TP4056 charging and MCU-controlled modem power-gating assumptions. |
+## Runtime sequence
 
-> **Important:** Rev 1 modem power sequencing and delays are intentional. Do not transfer Rev 1 power-control assumptions to Rev 2, or change the modem enable/startup sequence without hardware-specific validation.
+1. Initialize the STM32 unique device ID, peripherals, microSD, LIS3DH, and ADS1292R.
+2. Recover any completed `.RDY` files left on the SD card from an earlier reset or failed connection.
+3. Enable and initialize the A7670G, wait for LTE registration, and establish a PDP context.
+4. Drain previously queued files before starting another recording.
+5. Capture 2,500 ADS1292R samples over approximately 10 seconds at 250 samples per second. LIS3DH XYZ readings are included in the same CSV rows.
+6. Write the recording to `ACTIVE.TMP`, synchronize it, then rename the completed file to `.RDY`.
+7. Upload queued `.RDY` files over HTTPS. The modem retries transient failures, including TLS-related HTTP 715 responses.
+8. Delete a queued file only after HTTP 200. Otherwise retain it on the SD card and retry later.
+9. Repeat the record-and-upload cycle.
 
-## Peripheral bring-up branches
+## Telemetry format
 
-The following branches preserve focused development and validation work. They are useful reference points when working on an individual subsystem; they are not substitutes for the appropriate Rev 1 or Rev 2 baseline.
+Each file starts with the STM32 device identity followed by:
 
-| Branch | Focus |
-| --- | --- |
-| [`board_init`](../../tree/board_init) | Early STM32CubeMX foundation: pin/peripheral setup, clock configuration, and SPI1 8-bit data configuration. This is a historical firmware bring-up branch, not a board variant. |
-| [`feature/SWD-Test-ST_Link_V2`](../../tree/feature/SWD-Test-ST_Link_V2) | SWD connectivity and serial-debug validation. |
-| [`feature/SPI-Test-ADS1292`](../../tree/feature/SPI-Test-ADS1292) | ADS1292R SPI communication, ECG acquisition, and synchronized replay-capture hardening. |
-| [`feature/I2C-Test-LIS3DH`](../../tree/feature/I2C-Test-LIS3DH) | LIS3DH I2C communication and `WHO_AM_I` verification. |
-| [`feat/lis3dh-xyz-readout`](../../tree/feat/lis3dh-xyz-readout) | LIS3DH three-axis motion-data readout. |
-| [`feature/SDMMC-Test-MicroSD`](../../tree/feature/SDMMC-Test-MicroSD) | SDMMC/FatFS storage and the SD-first telemetry/logging baseline. |
-| [`feature/UART-Test-A7670G`](../../tree/feature/UART-Test-A7670G) | A7670G power-up, UART/AT-command verification, and telemetry upload work. |
+```text
+timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2
+```
 
-## Implemented subsystems
+CH2 carries the RA–LA ECG measurement. CH1 is internally shorted for diagnostic use. Motion is sampled at a lower effective rate and repeated across ECG rows.
 
-- ECG capture through the ADS1292R.
-- Motion acquisition through the LIS3DH.
-- microSD logging through SDMMC and FatFS.
-- A7670G LTE network registration and server uplink.
-- STM32 unique-device identity included in telemetry.
-- Optional V1 battery-rail voltage metadata from `AT+CBC` (implemented on
-  `v1-lipo-modem-gate`; hardware validation pending).
+## Reliability behavior
 
-## Repository layout
+- SD storage is the source of truth until the server acknowledges an upload.
+- Startup queue recovery preserves completed recordings across resets.
+- ADS1292R start, frame, timing, and SPI failures are exposed through debugger diagnostics.
+- SD write, synchronization, finalization, and queue failures remain visible and trigger recovery instead of silent deletion.
+- The modem remains powered during normal repeated uploads to avoid unnecessary reconnect cycles.
 
-- `Core/` — application code, STM32 startup code, and hardware-abstraction configuration.
-- `Drivers/` — STM32 HAL and CMSIS dependencies.
-- `FATFS/` and `Middlewares/` — filesystem and storage support.
-- `tests/` / `Tests/` — targeted regression and bench-test artifacts.
-- `ecg monitoring telemetry.ioc` — STM32CubeMX hardware/project configuration; treat GPIO and peripheral settings as hardware definition.
+## Known limitation
 
-## Working safely
+The firmware can query `AT+CBC` and attach `X-Battery-Millivolts`, but the tested board returned no usable reading: `battery_voltage_mv` remained zero and every query failed. Battery percentage is therefore not currently available or validated. Capture `last_modem_response` and `battery_last_response` during a future `AT+CBC` test before changing the implementation.
 
-1. Confirm whether the connected board is Rev 1 or Rev 2 before modifying GPIO, power, modem, or initialization code.
-2. Preserve known-good ADS1292R, LIS3DH, microSD, and A7670G behavior unless the task specifically requires a change.
-3. Validate changes incrementally: power rails and boot, peripheral communication, acquisition/logging, modem registration, then uplink.
-4. Do not treat a build or static test as proof of hardware validation; record the target board and bench result for meaningful firmware milestones.
+## Important files
+
+- `Core/Src/main.c` — acquisition, storage, modem, and application state flow.
+- `Core/Src/stm32l4xx_it.c` — ADS1292R data-ready interrupt handling.
+- `FATFS/Target/` — SDMMC/FatFS integration.
+- `ecg monitoring telemetry.ioc` — CubeMX hardware configuration.
+- `docs/SD_FIRST_TELEMETRY.md` — detailed storage and queue behavior.
+
+Preserve the known-good ADS1292R setup, SPI timing, SDMMC clock divider, and modem power sequence unless a change is supported by hardware evidence.
