@@ -45,8 +45,7 @@ PB8 controls the TPS22969DNYR rail feeding the A7670G. The current
 and upload cycles to preserve the tested TLS behavior. The existing 715
 recovery path may still cycle the modem rail.
 
-After a successful modem boot, firmware issues `AT+CBC`. The A7670G reports its
-supply voltage, which is the battery-fed modem rail on V1. A valid 2,500-5,000
+After a successful modem boot, firmware issues `AT+CBC`. A plausible 2,500-5,000
 mV result is exposed in `battery_voltage_mv` and sent with each upload as:
 
 ```text
@@ -54,13 +53,18 @@ X-Battery-Millivolts: 3749
 ```
 
 The header is optional. A failed query or header command increments its
-diagnostic counter but does not stop the ECG upload. The TirtaTrace server
-stores the voltage with the recording and does not infer a Li-Po percentage.
+diagnostic counter but does not stop the ECG upload. A complete but implausible
+`+CBC` reply increments `battery_invalid_readings` and is not retried. The
+TirtaTrace server stores a valid voltage with the recording and does not infer
+a Li-Po percentage.
 
 ## Current validation status
 
-As of 2026-09-13, the battery metadata change builds with GNU Tools for STM32
-14.3 and passes the firmware source-contract suite. It has not yet been
-validated on the physical V1 board. During the first run, confirm a plausible
-`battery_voltage_mv`, zero `battery_header_failures`, HTTP 200, and the same
-voltage on the latest TirtaTrace recording.
+On 2026-09-22, the V1 board completed 14 recordings and 14 HTTP 200 uploads.
+`AT+CBC` replied `+CBC: 0.030V` each time, so battery voltage was correctly
+omitted. This response does not represent the operating Li-Po rail. The V1
+CubeMX configuration has no battery ADC channel; a verified
+hardware measurement path is needed before voltage or percentage can be shown.
+`AT+CPSI?` successfully returned MCC `636`, MNC `01`, TAC `0x2BEE`, and serving
+Cell ID `29979556`. Header acceptance by the modem is visible; server storage
+of these fields still depends on backend support.

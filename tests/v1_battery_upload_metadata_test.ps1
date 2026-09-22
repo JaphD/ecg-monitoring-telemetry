@@ -15,6 +15,22 @@ if ($source -notmatch 'battery_voltage_mv') {
     throw 'V1 firmware must expose the last parsed battery voltage for hardware validation.'
 }
 
+if ($source -notmatch 'BATTERY_QUERY_MAX_ATTEMPTS\s+2U') {
+    throw 'V1 battery queries must receive one bounded retry before being marked unavailable.'
+}
+
+if ($source -notmatch 'battery_query_attempts') {
+    throw 'V1 firmware must expose the number of AT+CBC attempts for hardware diagnosis.'
+}
+
+if ($source -notmatch 'battery_invalid_readings') {
+    throw 'Implausible but complete AT+CBC readings must be distinguishable from transport failures.'
+}
+
+if ($source -notmatch 'if\s*\(\s*command_ok\s*&&\s*strstr\([^;]*"\+CBC:"\)\s*!=\s*NULL\s*\)\s*\{[^}]*battery_invalid_readings\+\+;[^}]*break;') {
+    throw 'A complete but implausible AT+CBC response must not trigger an identical retry.'
+}
+
 if ($source -match '#define CSV_HEADER[^\r\n]*battery') {
     throw 'Battery metadata must not change the validated ECG CSV row contract.'
 }

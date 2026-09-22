@@ -35,6 +35,7 @@ static void MX_USART1_UART_Init(void);
 #define RECORD_PROGRESS_TIMEOUT_MS 3000U
 #define HTTP_MAX_ATTEMPTS          3U
 #define HTTP_RETRY_BACKOFF_MS      5000U
+#define BATTERY_QUERY_MAX_ATTEMPTS 2U
 #define UPLOAD_RETRY_IDLE_MS       60000U
 #define SD_RECORD_START_RETRY_MS   5000U
 #define ADS_START_RECOVERY_MS      5000U
@@ -182,6 +183,7 @@ volatile uint32_t http_status_200_count = 0U;
 volatile uint32_t http_status_715_count = 0U;
 volatile uint32_t http_status_422_count = 0U;
 volatile uint32_t http_status_other_count = 0U;
+volatile uint32_t last_http_non200_status = 0U;
 volatile uint32_t httpaction_wait_failures = 0U;
 volatile uint32_t httpterm_failures = 0U;
 volatile uint32_t httpinit_failures = 0U;
@@ -293,10 +295,20 @@ volatile uint32_t modem_rx_start_failures = 0U;
 volatile uint32_t modem_tx_failures = 0U;
 volatile uint32_t modem_command_timeouts = 0U;
 volatile uint32_t battery_voltage_mv = 0U;
+volatile uint32_t battery_query_attempts = 0U;
 volatile uint32_t battery_query_successes = 0U;
 volatile uint32_t battery_query_failures = 0U;
+volatile uint32_t battery_invalid_readings = 0U;
 volatile uint32_t battery_header_failures = 0U;
 volatile char battery_last_response[64] = {0};
+volatile char network_mcc[4] = {0};
+volatile char network_mnc[4] = {0};
+volatile char network_tac[10] = {0};
+volatile char network_cell_id[16] = {0};
+volatile uint32_t network_query_successes = 0U;
+volatile uint32_t network_query_failures = 0U;
+volatile uint32_t network_header_failures = 0U;
+volatile char network_last_response[192] = {0};
 volatile char upload_failure_step[64] = {0};
 volatile char upload_failure_response[512] = {0};
 volatile char record_abort_reason[64] = {0};
@@ -1648,25 +1660,117 @@ static uint8_t Modem_ReadBatteryVoltage(void)
     battery_voltage_mv = 0U;
     battery_last_response[0] = '\0';
 
-    if (!Modem_Command("AT+CBC\r\n", "+CBC:", 3000U, 1U))
+    for (uint32_t attempt = 0U; attempt < BATTERY_QUERY_MAX_ATTEMPTS; attempt++)
     {
-        battery_query_failures++;
-        return 0U;
+        battery_query_attempts++;
+        uint8_t command_ok = Modem_Command("AT+CBC\r\n", "+CBC:", 5000U, 1U);
+        snprintf((char *)battery_last_response, sizeof(battery_last_response),
+                 "%.*s", (int)(sizeof(battery_last_response) - 1U),
+                 (const char *)last_modem_response);
+
+        if (command_ok &&
+            Modem_ParseBatteryMillivolts((const char *)last_modem_response,
+                                         &parsed_mv))
+        {
+            battery_voltage_mv = parsed_mv;
+            battery_query_successes++;
+            return 1U;
+        }
+
+        if (command_ok &&
+            strstr((const char *)last_modem_response, "+CBC:") != NULL)
+        {
+            battery_invalid_readings++;
+            break;
+        }
+
+        if ((attempt + 1U) < BATTERY_QUERY_MAX_ATTEMPTS)
+            HAL_Delay(250U);
     }
 
-    snprintf((char *)battery_last_response, sizeof(battery_last_response),
-             "%.*s", (int)(sizeof(battery_last_response) - 1U),
-             (const char *)last_modem_response);
-    if (!Modem_ParseBatteryMillivolts((const char *)last_modem_response,
-                                      &parsed_mv))
-    {
-        battery_query_failures++;
-        return 0U;
-    }
+    battery_query_failures++;
+    return 0U;
+}
 
-    battery_voltage_mv = parsed_mv;
-    battery_query_successes++;
+static uint8_t Modem_ParseNetworkMetadata(const char *response,
+                                          char *mcc, size_t mcc_size,
+                                          char *mnc, size_t mnc_size,
+                                          char *tac, size_t tac_size,
+                                          char *cell_id, size_t cell_id_size)
+{
+    char mode[16] = {0};
+    char operation[16] = {0};
+    char parsed_mcc[4] = {0};
+    char parsed_mnc[4] = {0};
+    char parsed_tac[10] = {0};
+    char parsed_cell_id[16] = {0};
+    const char *value = strstr(response, "+CPSI:");
+
+    if ((value == NULL) || (mcc == NULL) || (mnc == NULL) ||
+        (tac == NULL) || (cell_id == NULL) ||
+        (mcc_size < sizeof(parsed_mcc)) || (mnc_size < sizeof(parsed_mnc)) ||
+        (tac_size < sizeof(parsed_tac)) ||
+        (cell_id_size < sizeof(parsed_cell_id)))
+        return 0U;
+
+    value += strlen("+CPSI:");
+    while ((*value == ' ') || (*value == '\t')) value++;
+
+    if (sscanf(value, "%15[^,],%15[^,],%3[0-9]-%3[0-9],%9[^,],%15[0-9]",
+               mode, operation, parsed_mcc, parsed_mnc,
+               parsed_tac, parsed_cell_id) != 6)
+        return 0U;
+
+    if ((strncmp(mode, "LTE", 3U) != 0) ||
+        (strlen(parsed_mcc) != 3U) ||
+        ((strlen(parsed_mnc) != 2U) && (strlen(parsed_mnc) != 3U)) ||
+        (parsed_tac[0] == '\0') || (parsed_cell_id[0] == '\0'))
+        return 0U;
+
+    snprintf(mcc, mcc_size, "%s", parsed_mcc);
+    snprintf(mnc, mnc_size, "%s", parsed_mnc);
+    snprintf(tac, tac_size, "%s", parsed_tac);
+    snprintf(cell_id, cell_id_size, "%s", parsed_cell_id);
     return 1U;
+}
+
+static uint8_t Modem_ReadNetworkMetadata(void)
+{
+    network_mcc[0] = '\0';
+    network_mnc[0] = '\0';
+    network_tac[0] = '\0';
+    network_cell_id[0] = '\0';
+    network_last_response[0] = '\0';
+
+    uint8_t command_ok = Modem_Command("AT+CPSI?\r\n", "+CPSI:", 5000U, 1U);
+    snprintf((char *)network_last_response, sizeof(network_last_response),
+             "%.*s", (int)(sizeof(network_last_response) - 1U),
+             (const char *)last_modem_response);
+
+    if (!command_ok ||
+        !Modem_ParseNetworkMetadata((const char *)last_modem_response,
+                                    (char *)network_mcc, sizeof(network_mcc),
+                                    (char *)network_mnc, sizeof(network_mnc),
+                                    (char *)network_tac, sizeof(network_tac),
+                                    (char *)network_cell_id,
+                                    sizeof(network_cell_id)))
+    {
+        network_query_failures++;
+        return 0U;
+    }
+
+    network_query_successes++;
+    return 1U;
+}
+
+static uint8_t HTTP_AppendHeader(char *headers, size_t headers_size,
+                                 const char *name, const char *value)
+{
+    size_t used = strlen(headers);
+    int written = snprintf(headers + used, headers_size - used,
+                           "%s%s: %s", (used > 0U) ? "\\r\\n" : "",
+                           name, value);
+    return (written >= 0) && ((size_t)written < (headers_size - used));
 }
 
 static void Upload_CaptureFailure(const char *step)
@@ -1721,7 +1825,9 @@ static uint8_t HTTP_PostFile(const char *path)
         return 0U;
     }
     uint32_t file_size = (uint32_t)info.fsize;
-    char command[200];
+    char command[256];
+    char user_headers[192] = {0};
+    char battery_value[12] = {0};
     uint8_t success = 0U;
     current_http_status = 0U;
     upload_bytes_sent = 0U;
@@ -1758,11 +1864,32 @@ static uint8_t HTTP_PostFile(const char *path)
     }
     if (battery_voltage_mv > 0U)
     {
-        snprintf(command, sizeof(command),
-                 "AT+HTTPPARA=\"USERDATA\",\"X-Battery-Millivolts: %lu\"\r\n",
+        snprintf(battery_value, sizeof(battery_value), "%lu",
                  (unsigned long)battery_voltage_mv);
+        (void)HTTP_AppendHeader(user_headers, sizeof(user_headers),
+                                "X-Battery-Millivolts", battery_value);
+    }
+    if (network_mcc[0] != '\0')
+    {
+        (void)HTTP_AppendHeader(user_headers, sizeof(user_headers),
+                                "X-Network-MCC", (const char *)network_mcc);
+        (void)HTTP_AppendHeader(user_headers, sizeof(user_headers),
+                                "X-Network-MNC", (const char *)network_mnc);
+        (void)HTTP_AppendHeader(user_headers, sizeof(user_headers),
+                                "X-Network-TAC", (const char *)network_tac);
+        (void)HTTP_AppendHeader(user_headers, sizeof(user_headers),
+                                "X-Network-Cell-ID",
+                                (const char *)network_cell_id);
+    }
+    if (user_headers[0] != '\0')
+    {
+        snprintf(command, sizeof(command),
+                 "AT+HTTPPARA=\"USERDATA\",\"%s\"\r\n", user_headers);
         if (!Modem_Command(command, "OK", 3000U, 0U))
-            battery_header_failures++;
+        {
+            if (battery_voltage_mv > 0U) battery_header_failures++;
+            if (network_mcc[0] != '\0') network_header_failures++;
+        }
     }
     snprintf(command, sizeof(command), "AT+HTTPDATA=%lu,60000\r\n",
              (unsigned long)file_size);
@@ -1852,6 +1979,8 @@ static uint8_t HTTP_PostFile(const char *path)
         {
             current_http_status = (uint32_t)status;
             last_http_status = current_http_status;
+            if (current_http_status != 200U)
+                last_http_non200_status = current_http_status;
             switch (current_http_status)
             {
                 case 200U:
@@ -2228,6 +2357,7 @@ static void Run_UploadPhase(void)
         return;
     }
     (void)Modem_ReadBatteryVoltage();
+    (void)Modem_ReadNetworkMetadata();
     system_phase = 40U;
     snprintf((char *)system_status, sizeof(system_status),
              "Uploading %lu queued files", (unsigned long)sd_files_queued);

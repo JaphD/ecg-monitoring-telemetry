@@ -2,6 +2,10 @@ $ErrorActionPreference = 'Stop'
 
 $source = Get-Content -Raw (Join-Path $PSScriptRoot '..\Core\Src\main.c')
 
+if ($source -notmatch 'last_http_non200_status') {
+    throw 'The last non-200 HTTP status must remain visible after a successful retry.'
+}
+
 $requiredPatterns = @(
     '#define HTTP_MAX_ATTEMPTS\s+3U',
     'last_upload_attempts',
