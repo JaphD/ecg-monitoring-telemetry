@@ -10,11 +10,11 @@ The ECG electrode connections are RA, LA, and RL. ADS1292R channel 2 carries the
 
 **Rev 1 PCB layout render**
 
-<img src="docs/images/v1-pcb-layout.png" alt="Rev 1 battery-powered ECG, motion, SD, and LTE board layout render" width="760">
+<img src="assets/v1-pcb-layout.png" alt="Rev 1 battery-powered ECG, motion, SD, and LTE board layout render" width="760">
 
 **Assembled Rev 1 board with Li-Po battery and LTE antenna**
 
-<img src="docs/images/v1-assembled-board.jpg" alt="Assembled Rev 1 ECG board with connected Li-Po battery and LTE antenna" width="520">
+<img src="assets/v1-assembled-board.jpg" alt="Assembled Rev 1 ECG board with connected Li-Po battery and LTE antenna" width="520">
 
 ## What the firmware does
 
@@ -40,6 +40,5 @@ Firmware also queries `AT+CPSI?` for the serving LTE cell. When available, MCC, 
 - `Core/Src/stm32l4xx_it.c` — ADS1292R data-ready interrupt handling.
 - `FATFS/Target/` — SDMMC and FatFS integration.
 - `ecg monitoring telemetry.ioc` — STM32CubeMX pin and peripheral configuration.
-- [`docs/SD_FIRST_TELEMETRY.md`](docs/SD_FIRST_TELEMETRY.md) — SD-first behavior, diagnostics, and test observations.
 
 Preserve the validated ADS1292R setup, SPI timing, SDMMC clock divider, and V1 modem power sequence when making changes.
