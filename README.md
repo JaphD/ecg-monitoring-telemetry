@@ -34,15 +34,6 @@ timestamp,accel_x,accel_y,accel_z,ecg_ch1,ecg_ch2
 
 Firmware also queries `AT+CPSI?` for the serving LTE cell. When available, MCC, MNC, TAC, and Cell ID are sent as optional `X-Network-*` HTTP headers; the CSV format is unchanged. TAC is the LTE counterpart of the 2G/3G LAC requested for the dashboard. A failed metadata query does not block an ECG upload.
 
-## Verified status and limits
-
-- The September 13, 2026 V1 run completed 21 recordings and 21 HTTP 200 uploads without observed acquisition or SD errors.
-- The September 22, 2026 V1 run completed 14 recordings and 14 HTTP 200 uploads. The modem reported MCC `636`, MNC `01`, TAC `0x2BEE`, and Cell ID `29979556`. The modem accepted the optional header command; receipt and storage of those fields by the server still need confirmation.
-- `AT+CBC` repeatedly returned `+CBC: 0.030V`, which is not a plausible operating Li-Po voltage. The board schematic leaves the modem's `VBAT_ADC` input unconnected, so battery voltage and percentage are unavailable on this revision. Firmware omits the battery header when the reading is invalid.
-- One extra HTTP attempt in the September 22 run produced a non-200 status before recovery. The latest diagnostic code retains that status for the next hardware test; its exact value was not captured in the earlier run.
-
-The September 22 run exercised the serving-cell query and upload path, but did not establish server storage of the headers. The subsequent battery diagnostic and HTTP status changes have not yet had a new hardware test.
-
 ## Project files
 
 - `Core/Src/main.c` — acquisition, SD queue, modem, and upload state flow.
